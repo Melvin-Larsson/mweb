@@ -10,6 +10,8 @@ typedef enum{
     ServerWorkerUnableToCreateSSLContext,
     ServerWorkerPortCreationError,
     ServerWorkerListenError,
+
+    ServerWorkerClientDisconnected,
 }ServerWorkerStatus;
 
 typedef struct ServerWorker ServerWorker;

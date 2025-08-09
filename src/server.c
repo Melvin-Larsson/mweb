@@ -111,6 +111,7 @@ char *create_ok_response(char *content, ContentType type){
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Cross-Origin-Opener-Policy: same-origin-allow-popups\r\n"
         "Referrer-Policy: no-referrer-when-downgrade\r\n"
+        "Connection: close\r\n"
         "Content-Length: %zu\r\n"
         "\r\n"
         "%s";
@@ -119,6 +120,7 @@ char *create_ok_response(char *content, ContentType type){
         "Content-Type: text/css; charset=UTF-8\r\n"
         "Cross-Origin-Opener-Policy: same-origin-allow-popups\r\n"
         "Referrer-Policy: no-referrer-when-downgrade\r\n"
+        "Connection: close\r\n"
         "Content-Length: %zu\r\n"
         "\r\n"
         "%s";
