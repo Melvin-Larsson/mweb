@@ -1,0 +1,6 @@
+{
+  "Port": 6969,
+  "Certificate": "./build/cert.pem",
+  "PrivateKey": "./build/key.pem",
+  "Content": "./content"
+}

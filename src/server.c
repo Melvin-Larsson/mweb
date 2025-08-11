@@ -9,16 +9,16 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <sys/epoll.h>
+#include "cJSON.h"
 #include "openssl/ssl.h"
 #include "openssl/err.h"
 #include "assert.h"
 #include "server_worker.h"
 #include "stringbuilder.h"
 #include "dirent.h"
+#include "config_manager.h"
+#include "http2/http2.h"
 // #include "fcntl.h"
-
-#define PORT 443
-#define CONTENT_PATH_ENV_NAME "CONTENT_PATH"
 
 typedef enum{
     HTML,
@@ -30,11 +30,16 @@ typedef enum{
 //     SSL *ssl;
 //     int socketfd;
 // }Client;
+//
+
+static char *content_path;
+cJSON *routes_json = NULL;
 
 static int served_count = 0;
 
 typedef struct{
     char *name;
+    char *route;
     char *page;
 }Page;
 
@@ -47,7 +52,7 @@ typedef struct{
 char *load_file(const char *path){
     FILE *f = fopen(path, "rb");
     if(f == NULL){
-        fprintf(stderr, "Failed to open file '%s'", path);
+        fprintf(stderr, "Failed to open file '%s'\n", path);
         return NULL;
     }
     fseek(f, 0, SEEK_END);
@@ -59,7 +64,7 @@ char *load_file(const char *path){
     fclose(f);
 
     if(size == 0){
-        fprintf(stderr, "Failed to read file '%s'", path);
+        fprintf(stderr, "Failed to read file '%s'\n", path);
         free(result);
         return NULL;
     }
@@ -86,7 +91,7 @@ char *load_content_file(char *name){
     return content;
 }
 
-bool add_page_to_content(Content *content, char *page, char *name){
+bool add_page_to_content(Content *content, char *page, char *name, char *route){
     if(content->page_count == content->page_buffer_size){
         size_t new_page_buffer_size = content->page_buffer_size * 3 / 2;
         Page *new_page_buffer = realloc(content->pages, new_page_buffer_size); 
@@ -99,11 +104,42 @@ bool add_page_to_content(Content *content, char *page, char *name){
 
     content->pages[content->page_count] = (Page){
         .page = page,
-        .name = name
+        .name = name,
+        .route = route
     };
     content->page_count++;
 
     return true;
+}
+
+bool add_page_to_content_with_routes(Content *content, char *page, char *name){
+    printf("Adding page '%s'\n", name);
+    bool status = add_page_to_content(content, page, name, name);
+    if(routes_json == NULL){
+        return status;
+    }
+    cJSON *routes = cJSON_GetObjectItemCaseSensitive(routes_json, name);
+    if(routes == NULL){
+        return status;
+    }
+    if(!cJSON_IsArray(routes)){
+        fprintf(stderr, "Value for '%s' is not a valid array\n", name);
+        return status;
+    }
+    cJSON *route;
+    cJSON_ArrayForEach(route, routes)
+    {
+        if(!cJSON_IsString(route) || route->valuestring == NULL){
+            fprintf(stderr, "Found invalid string in routes array for '%s'\n", name);
+        }
+        else{
+            char *str = strdup(route->valuestring);
+            printf("Routing '%s' to '%s'\n", str, name);
+            status = status && add_page_to_content(content, page, name, str);
+        }
+    }
+
+    return status;
 }
 
 char *create_ok_response(char *content, ContentType type){
@@ -111,7 +147,6 @@ char *create_ok_response(char *content, ContentType type){
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Cross-Origin-Opener-Policy: same-origin-allow-popups\r\n"
         "Referrer-Policy: no-referrer-when-downgrade\r\n"
-        "Connection: close\r\n"
         "Content-Length: %zu\r\n"
         "\r\n"
         "%s";
@@ -120,7 +155,6 @@ char *create_ok_response(char *content, ContentType type){
         "Content-Type: text/css; charset=UTF-8\r\n"
         "Cross-Origin-Opener-Policy: same-origin-allow-popups\r\n"
         "Referrer-Policy: no-referrer-when-downgrade\r\n"
-        "Connection: close\r\n"
         "Content-Length: %zu\r\n"
         "\r\n"
         "%s";
@@ -157,10 +191,6 @@ char *concat_path(char *path1, char *path2){
 char *get_full_content_path(char *relative_path){
     assert(relative_path != NULL);
 
-    char *content_path = getenv(CONTENT_PATH_ENV_NAME);
-    if(content_path == NULL){
-        return NULL;
-    }
     return concat_path(content_path, relative_path);
 }
 
@@ -242,7 +272,7 @@ bool load_content_from_dir(char *root_path, Content *result){
                 free(full_file_path);
                 break;
             }
-            if(!add_page_to_content(result, content, relative_path)){
+            if(!add_page_to_content_with_routes(result, content, relative_path)){
                 free(relative_path);
                 free(full_file_path);
                 free(content);
@@ -426,13 +456,37 @@ char *populate_page(char *content){
     return string_builder_to_string_and_free(string_builder);
 }
 
-Page *find_page(Content *content, char *name){
-    if(strcmp(name, "/") == 0){
-        name = "/index.html";
+bool route_equals_ignoring_html(char *r1, char *r2){
+    while(*r1 && *r2){
+        if(*r1 != *r2){
+            break;
+        }
+        r1++;
+        r2++;
+    } 
+
+    if(*r1 == '\0' && *r2 == '\0'){
+        return true;
+    }
+
+    if(*r1 == '\0' && strcmp(r2, ".html") == 0){
+        return true;
+    }
+
+    if(*r2 == '\0' && strcmp(r1, ".html") == 0){
+        return true;
+    }
+
+    return false;
+}
+
+Page *find_page(Content *content, char *route){
+    if(strcmp(route, "/") == 0){
+        route = "/index.html";
     }
 
     for(size_t i = 0; i < content->page_count; i++){
-        if(strcmp(content->pages[i].name, name) == 0 || strncmp(content->pages[i].name, name, strlen(content->pages[i].name) - strlen(".html")) == 0){
+        if(route_equals_ignoring_html(content->pages[i].route, route)){
             return &content->pages[i];
         }
     }
@@ -447,17 +501,22 @@ void signal_handler(int signal){
 }
 
 Content *content;
-void on_data(void *u, const Client *client, char *buff, size_t len){
+void on_data(void *u, const ClientHandle client, char *buff, size_t len){
    printf("Received: '%.*s'\n", (int)len, buff); 
+   http2_handle_message(u, client, buff, len);
+   return;
 
-    char response_404[] = "HTTP/1.1 404 Not Found\n"
-        "Content-Type: text/html; charset=UTF-8\n"
+    char response_404[] = "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: 0\n\n";
+
+    char response_400[] = "HTTP/1.1 400 Bad Request\r\n"
+        "Connection: close\r\n\r\n";
    char *get = "GET ";
 
    if(strncmp(buff, get, strlen(get)) != 0){
        printf("no GET\n");
-       exit(EXIT_FAILURE);
+       server_worker_send(sworker, client, response_400, strlen(response_400));
        return;
    }
    char *requested_content = buff + strlen(get);
@@ -467,12 +526,13 @@ void on_data(void *u, const Client *client, char *buff, size_t len){
    }
    if(!*ptr){
        printf("bad request\n");
-       exit(EXIT_FAILURE);
+       server_worker_send(sworker, client, response_400, strlen(response_400));
        return;
    }
    *ptr = '\0';
 
    printf("Received request for page '%s'\n", requested_content);
+   served_count++;
    Page *page = find_page(content, requested_content);
    if(page != NULL){
        ContentType type = get_content_type(page->name);
@@ -498,213 +558,119 @@ void on_data(void *u, const Client *client, char *buff, size_t len){
    }
 }
 
+void error_handler(int signal){
+    printf("Signal %d received. Ignoring...\n", signal);
+}
+
+int alpn_select_cb(SSL *ssl,
+                   const unsigned char **out,
+                   unsigned char *outlen,
+                   const unsigned char *in,
+                   unsigned int inlen,
+                   void *arg) {
+
+    static const unsigned char alpn_h2[] = { 
+        2, 'h', '2',
+        8, 'h','t','t','p','/','1', '.', '1'
+    };
+
+    if (SSL_select_next_proto((unsigned char **)out, outlen, alpn_h2, sizeof(alpn_h2), in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_OK;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
+bool configure_ssl(void *data, SSL_CTX *ctx){
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
+    return true;
+}
+
 int server_run(){
-    if(!try_load_resources(&content)){
-        exit(EXIT_FAILURE);
+    int status = 0;
+
+    ConfigManager *manager = config_manager_load_from_appconfig();
+    if(manager == NULL){
+        fprintf(stderr, "Config Error: to load config file. Exiting...\n");
+        return 1;
     }
 
-    sworker = server_worker_new();
+    int port;
+    const char *cert_path, *private_key_path, *cp;
+
+    bool cert_status = config_manager_try_get_str(manager, "Certificate", &cert_path);
+    bool key_status = config_manager_try_get_str(manager, "PrivateKey", &private_key_path);
+    bool port_status = config_manager_try_get_int(manager, "Port", &port);
+    bool content_path_status = config_manager_try_get_str(manager, "Content", &cp);
+
+    if(!cert_status){
+        fprintf(stderr, "Config Error: Unable to load 'Certificate'.\n");
+    }
+    if(!key_status){
+        fprintf(stderr, "Config Error: Unable to load 'PrivateKey'.\n");
+    }
+    if(!port_status){
+        fprintf(stderr, "Config Error: Unable to load 'Port'.\n");
+    }
+    if(!content_path_status){
+        fprintf(stderr, "Config Error: Unable to load 'Content'.\n");
+    }
+    if(!cert_status || !key_status || !port_status || !content_path_status){
+        fprintf(stderr, "Exiting...\n");
+        status = 1;
+        goto exit_manager;
+    }
+
+    char *routes_file_path = malloc(strlen(cp) + strlen("/") + strlen("routes.json") + 1);
+    strcpy(routes_file_path, cp);
+    strcat(routes_file_path, "/");
+    strcat(routes_file_path, "routes.json");
+    char *routes_content = load_file(routes_file_path);
+    free(routes_file_path);
+    if(routes_content != NULL){
+        printf("Parsing routes.json\n");
+        routes_json = cJSON_Parse(routes_content);
+        free(routes_content);
+
+        if(routes_json == NULL){
+            printf("Unable to parse routes.json\n");
+        }
+        else{
+            printf("routes.json parsed\n");
+        }
+    }
+    else{
+        printf("Could not find routes.json\n");
+    }
+
+    content_path = strdup(cp);
+    if(!try_load_resources(&content)){
+        status = 1;
+        goto exit_content_path;
+    }
+
+    ServerWorkerConfig config = {
+        .cert_file_path = cert_path,
+        .private_key_path = private_key_path,
+        .port = port
+    };
+
+    sworker = server_worker_new(config);
     assert(sworker != NULL);
     server_worker_set_receive_callback(sworker, on_data, NULL);
+    server_worker_set_ssl_ctx_cb(sworker, configure_ssl, NULL);
 
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
+    signal(SIGPIPE, error_handler);
+
     server_worker_run(sworker);
+    server_worker_free(sworker);
 
-    return 0;
-
-
-//     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-//     if(sockfd < 0){
-//         perror("Socket fail");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     int opt = 1;
-//     if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0){
-//         perror("Failed to set socket options");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0){
-//         perror("Failed to set socket options");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     struct sockaddr_in address;
-//     socklen_t addrlen = sizeof(address);
-//     address.sin_family = AF_INET;
-//     address.sin_port = htons(PORT);
-//     address.sin_addr.s_addr = INADDR_ANY;
-
-//     if(bind(sockfd, (struct sockaddr *)&address, addrlen) < 0){
-//         perror("Bind failed");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     if(listen(sockfd, 3) < 0){
-//         perror("Listen");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     SSL_CTX *ctx = create_ssl_context();
-//     if(ctx == NULL){
-//         exit(EXIT_FAILURE);
-//     }
-
-//     char response_404[] = "HTTP/1.1 404 Not Found\n"
-//         "Content-Type: text/html; charset=UTF-8\n"
-//         "Content-Length: 0\n\n";
-
-//     int epollfd = epoll_create1(0);
-//     if(epollfd < 0){
-//         perror("Failed creating epoll");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     struct epoll_event socket_cfg = {
-//         .events = EPOLLIN,
-//         .data.fd = sockfd
-//     };
-//     if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &socket_cfg) < 0){
-//         perror("Failed to listen");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     printf("Listening on port %d...\n", PORT);
-
-//     struct epoll_event events[16];
-//     int client_count = 0;
-//     while(true){
-//         int epoll_result = epoll_wait(epollfd, events, sizeof(events)/sizeof(struct epoll_event), -1);
-//         if(epoll_result == -1){
-//             perror("Wait failed");
-//             exit(EXIT_FAILURE);
-//         }else if(epoll_result == 0){
-//             printf("what?\n");
-//             continue;
-//         }
-
-//         for(int i = 0; i < epoll_result; i++){
-//             if(events[i].data.fd == sockfd){
-//                 struct sockaddr_storage sockaddr;
-//                 socklen_t addrlen = sizeof(sockaddr);
-//                 int clientfd = accept(sockfd, (struct sockaddr *)&sockaddr, &addrlen);
-//                 if(clientfd < 0){
-//                     perror("Accept error");
-//                     continue;
-//                 }
-
-//                 if(sockaddr.ss_family == AF_INET){
-//                     struct sockaddr_in *sockaddr_ipv4 = (struct sockaddr_in *)&sockaddr;
-//                     uint8_t *addr = (uint8_t *)&sockaddr_ipv4->sin_addr.s_addr;
-//                     printf("Client of adddress %d.%d.%d.%d connected\n", addr[0], addr[1], addr[2], addr[3]);
-//                 }
-//                 else if(sockaddr.ss_family == AF_INET6){
-//                     struct sockaddr_in6 *sockaddr_ipv6 = (struct sockaddr_in6 *)&sockaddr;
-//                     printf("Client of adddress ");
-//                     uint8_t *addr = (uint8_t *)&sockaddr_ipv6->sin6_addr;
-//                     for(size_t i = 0; i < 16; i += 2){
-//                         printf("%X%X", addr[i], addr[i + 1]);
-//                         if(i < 14){
-//                             printf(":");
-//                         }
-//                     }
-//                     printf(" Connected\n");
-//                 }
-//                 else{
-//                     printf("Unknown address type %d connected\n", sockaddr.ss_family);
-//                 }
-// //                 int flags = fcntl(clientfd, F_GETFL, 0);
-// //                 fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-
-//                 printf("New ssl\n");
-//                 SSL *ssl = SSL_new(ctx);
-//                 if(SSL_set_fd(ssl, clientfd) != 1){
-//                     ERR_print_errors_fp(stderr);
-//                     SSL_free(ssl);
-//                     close(clientfd);
-//                     continue;
-//                 }
-
-//                 printf("Accept client ssl\n");
-//                 if(!SSL_accept(ssl)){
-//                 printf("Accept client ssl nooo\n");
-//                     fprintf(stderr, "Unable to accept client\n");
-//                     close(clientfd);
-//                     SSL_free(ssl);
-//                 }
-
-//                 printf("Allocate client space\n");
-//                 Client *client = malloc(sizeof(Client));
-//                 if(client == NULL){
-//                     fprintf(stderr, "Unable to malloc client\n");
-//                     close(clientfd);
-//                     SSL_free(ssl);
-//                 }
-//                 *client = (Client){
-//                     .socketfd = clientfd,
-//                     .ssl = ssl,
-//                 };
-
-//                 struct epoll_event new_event = {
-//                     .events = EPOLLIN | EPOLLOUT | EPOLLET,
-//                     .data.ptr = client
-//                 };
-//                 printf("Add clien to epoll\n");
-//                 if(epoll_ctl(epollfd, EPOLL_CTL_ADD, clientfd, &new_event) < 0){
-//                     perror("Failed to epoll connection");
-//                     close(clientfd);
-//                     free(client);
-//                     SSL_free(ssl);
-//                     continue;
-//                 }
-
-//                 client_count++;
-//                 setenv("TZ", "Europe/Stockholm", 1);
-//                 time_t now = time(NULL);
-//                 struct tm *local_time = localtime(&now);
-//                 char *time = asctime(local_time);
-//                 printf("Acceted client. %d clients connected at %s\n", client_count, asctime(local_time));
-//             }
-//             else{
-//                 Client *client = (Client *)events[i].data.ptr;
-
-//                 char buff[1024];
-//                 int size = SSL_read(client->ssl, buff, sizeof(buff) - 1);
-//                 if(size < 0){
-//                     goto disconnect;
-//                 }
-
-//                 buff[1023] = 0;
-
-//                 served_count++;
-
-// disconnect:
-//                 epoll_ctl(epollfd, EPOLL_CTL_DEL, client->socketfd, NULL);
-//                 SSL_shutdown(client->ssl);
-//                 SSL_free(client->ssl);
-//                 close(client->socketfd);
-//                 free(client);
-
-//                 client_count--;
-//                 printf("Client disconnect. %d clients connected\n", client_count);
-//             }
-//         }    
-//     }
-
-// exit:
-//     close(epollfd);
-//     close(sockfd);
-//     SSL_CTX_free(ctx);
-
-//     for(size_t i = 0; i < content->page_count; i++){
-//         Page *page = &content->pages[i];
-//         free(page->page);
-//         free(page->name);
-//     }
-//     free(content);
-
-//     return 0;
+exit_content_path:
+    free(content_path);
+    cJSON_Delete(routes_json);
+exit_manager:
+    config_manager_free(manager);
+    return status;
 }

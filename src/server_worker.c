@@ -54,12 +54,10 @@ typedef struct{
     size_t used_size;
 }DataBuffer;
 
-struct Client{
+typedef struct{
     volatile ClientStatus status;
 
     pthread_mutex_t write_lock;
-    atomic_uint writer_count;
-    pthread_cond_t no_writers_cond;
 
     int socket;
     struct sockaddr_storage address;
@@ -69,19 +67,25 @@ struct Client{
     DataBuffer in_flight_out_buffer;
     DataBuffer out_buffer;
 
-    ssize_t buffer_index;
-};
+    ClientHandle handle;
+}Client;
 
 typedef struct{
-    Client **clients;
+    volatile uint64_t generation;
+    atomic_long accessor_count; 
+    pthread_cond_t no_accessors;
+    Client *client;
+}ClientEntry;
+
+typedef struct{
+    ClientEntry *clients;
     size_t client_buffer_size;
-    size_t client_count;
 }ClientBuffer;
 
 typedef struct{
     pthread_mutex_t lock;
     int enqueu_event_fd;
-    Client **clients;
+    ClientHandle *clients;
     size_t queue_size;
     size_t enqueue;
     size_t dequeue;
@@ -89,20 +93,28 @@ typedef struct{
 
 typedef struct{
     void *u_data;
-    void (*invoke)(void *u_data, const Client *client, char *received, size_t size);
+    void (*invoke)(void *u_data, const ClientHandle client, char *received, size_t size);
 }ReceivedCallback;
 
+typedef struct{
+    void *u_data;
+    bool (*invoke)(void *u_data, SSL_CTX *ctx);
+}ConfigureSSLCtxCallback;
+
 struct ServerWorker{
-    int port;
     SSL_CTX *ssl_ctx;
     int socket;
     int stopfd;
     int epollfd;
 
     ClientBuffer client_buffer;
+
     ReceivedCallback receivedCallback;
+    ConfigureSSLCtxCallback sslCtxCallback;
 
     ClientQueue write_queue;
+
+    ServerWorkerConfig config;
 };
 
 static bool _client_buffer_initialize(ClientBuffer *buffer);
@@ -110,6 +122,8 @@ static void _client_buffer_clear(ClientBuffer *buffer);
 static bool _client_buffer_add(ClientBuffer *buffer, Client *client);
 static void _client_buffer_remove(ClientBuffer *buffer, Client *client);
 static void _client_buffer_defragment(ClientBuffer *buffer);
+static Client *_client_buffer_get_client(ServerWorker *worker, ClientHandle hande);
+static void _client_buffer_release_client(ServerWorker *worker, ClientHandle hande);
 
 static void _data_buffer_initialize_empty(DataBuffer *buffer);
 static bool _data_buffer_initialize_with_data(DataBuffer *buffer, const char *data, size_t data_len);
@@ -118,13 +132,13 @@ static bool _data_buffer_add(DataBuffer *buffer, const char *data, size_t data_l
 
 static bool _client_queue_initialize(ClientQueue *queue);
 static void _client_queue_clear(ClientQueue *queue);
-static bool _client_queue_enqueue(ClientQueue *queue, Client *client);
-static bool _client_queue_dequeue(ClientQueue *queue, Client **result);
-static void _client_queue_remove_client(ClientQueue *queue, Client *client);
-static size_t _client_queue_dequeue_n(ClientQueue *queue, Client **result, size_t buffer_size);
+static bool _client_queue_enqueue(ClientQueue *queue, ClientHandle handle);
+static bool _client_queue_dequeue(ClientQueue *queue, ClientHandle *result);
+static size_t _client_queue_dequeue_n(ClientQueue *queue, ClientHandle *result, size_t buffer_size);
 static bool _client_queue_resize_without_lock(ClientQueue *queue, size_t new_size);
 
-static SSL_CTX * _create_ssl_context();
+
+static SSL_CTX * _create_ssl_context(ServerWorkerConfig *config);
 static int _create_listen_socket(int port);
 static ServerWorkerStatus _listen(ServerWorker *worker);
 
@@ -142,45 +156,64 @@ static int _ip_str(struct sockaddr *sockaddr, char *result, size_t buffer_size);
 static bool _set_nonblocking(int fd);
 static bool _try_check_is_nonblocking(int fd, bool *result);
 
-ServerWorker *server_worker_new(){
+ServerWorker *server_worker_new(ServerWorkerConfig config){
     ServerWorker *worker = malloc(sizeof(ServerWorker));
     if(worker == NULL){
         return NULL;
     }
 
-    if(!_client_buffer_initialize(&worker->client_buffer)){
+    ServerWorkerConfig config_copy = {
+        .cert_file_path = strdup(config.cert_file_path),
+        .private_key_path = strdup(config.private_key_path),
+        .port = config.port
+    };
+
+    if(config_copy.cert_file_path == NULL || config_copy.private_key_path == NULL){
+        free((char *)config.cert_file_path);
+        free((char *)config.private_key_path);
         goto exit_worker;
     }
 
     *worker = (ServerWorker){
-        .port = 6969,
-        .stopfd = eventfd(0, 0),
         .ssl_ctx = NULL,
         .socket = -1,
         .epollfd = -1,
+        .receivedCallback = {NULL, NULL},
+        .config = config_copy
     };
 
+    worker->stopfd = eventfd(0, 0);
     if(worker->stopfd == -1){
-        goto exit_client_buffer;
+        goto exit_worker;
+    }
+
+    if(!_client_buffer_initialize(&worker->client_buffer)){
+        goto exit_stop_fd;
     }
 
     if(!_client_queue_initialize(&worker->write_queue)){
-        goto exit_stop_fd;
+        goto exit_client_buffer;
     }
 
     return worker;
 
-exit_stop_fd:
-    close(worker->stopfd);
 exit_client_buffer:
     _client_buffer_clear(&worker->client_buffer);
+exit_stop_fd:
+    close(worker->stopfd);
 exit_worker:
     free(worker);
     return NULL;
 }
 
-void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, const Client *client, char *received, size_t size), void *u_data){
+void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client, char *received, size_t size), void *u_data){
     worker->receivedCallback = (ReceivedCallback){
+        .u_data = u_data,
+        .invoke = callback
+    };
+}
+void server_worker_set_ssl_ctx_cb(ServerWorker *worker, bool (*callback)(void *u_data, SSL_CTX *ctx ), void *u_data){
+    worker->sslCtxCallback = (ConfigureSSLCtxCallback){
         .u_data = u_data,
         .invoke = callback
     };
@@ -191,25 +224,41 @@ void server_worker_free(ServerWorker *worker){
         return;
     }
 
+    LOG_DEBUG("Freeing ssl ctx");
     if(worker->ssl_ctx){
         SSL_CTX_free(worker->ssl_ctx);
         worker->ssl_ctx = NULL;
     }
 
+    LOG_DEBUG("Freeing socket");
     if(worker->socket > 0){
         close(worker->socket);
         worker->socket = -1;
     }
 
+    LOG_DEBUG("Freeing epoll");
     if(worker->epollfd > 0){
         close(worker->epollfd);
         worker->epollfd = -1;
     }
 
+    LOG_DEBUG("Freeing stopdf");
     if(worker->stopfd > 0){
         close(worker->stopfd);
         worker->stopfd = -1;
     }
+
+    LOG_DEBUG("Freeing client buffer");
+    _client_buffer_clear(&worker->client_buffer);
+
+    LOG_DEBUG("Freeing client queue");
+    _client_queue_clear(&worker->write_queue);
+
+    LOG_DEBUG("Cert/private key paths");
+    free((char *)worker->config.cert_file_path);
+    free((char *)worker->config.private_key_path);
+
+    free(worker);
 }
 
 ServerWorkerStatus server_worker_run(ServerWorker *worker){
@@ -217,55 +266,40 @@ ServerWorkerStatus server_worker_run(ServerWorker *worker){
     assert(worker->ssl_ctx ==NULL);
     assert(worker->socket < 0);
 
-    ServerWorkerStatus status = ServerWorkerStatusOk;
-
-    worker->ssl_ctx = _create_ssl_context();
+    worker->ssl_ctx = _create_ssl_context(&worker->config);
     if(worker->ssl_ctx == NULL){
-        status = ServerWorkerUnableToCreateSSLContext;
-        goto cleanup;
+        return ServerWorkerUnableToCreateSSLContext;
+    }
+    if(worker->sslCtxCallback.invoke && 
+            !worker->sslCtxCallback.invoke(worker->sslCtxCallback.u_data, worker->ssl_ctx)){
+        return ServerWorkerUnableToCreateSSLContext;
     }
 
-    worker->socket = _create_listen_socket(worker->port);
+    worker->socket = _create_listen_socket(worker->config.port);
 
     if(worker->socket < 0){
-        status = ServerWorkerPortCreationError;
-        goto cleanup;
+        return ServerWorkerPortCreationError;
     }
 
-    status = _listen(worker);
-
-
-cleanup:
-    server_worker_free(worker);
-    return status;
+    return _listen(worker);
 }
 
-ServerWorkerStatus server_worker_send(ServerWorker *worker, Client *client, char *buffer, size_t buffer_size){
+ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle handle, char *buffer, size_t buffer_size){
     assert(worker != NULL);
-    assert(client != NULL);
     assert(buffer != NULL);
-
-    if(client->status == Stopped){
-        return ServerWorkerClientDisconnected;
-    }
-
-    atomic_fetch_add(&client->writer_count, 1);
-
-    if(client->status == Stopped){
-        atomic_fetch_sub(&client->writer_count, 1);
+    Client *client = _client_buffer_get_client(worker, handle);
+    if(client == NULL){
         return ServerWorkerClientDisconnected;
     }
 
     pthread_mutex_lock(&client->write_lock);
 
     _data_buffer_add(&client->out_buffer, buffer, buffer_size);
-    _client_queue_enqueue(&worker->write_queue, client);
+    _client_queue_enqueue(&worker->write_queue, handle);
 
     pthread_mutex_unlock(&client->write_lock);
-    atomic_fetch_sub(&client->writer_count, 1);
-    if(atomic_load(&client->writer_count) == 0){
-        pthread_cond_signal(&client->no_writers_cond);
-    }
+
+    _client_buffer_release_client(worker, handle);
 
     return ServerWorkerStatusOk;
 }
@@ -287,6 +321,8 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
     assert(worker->write_queue.clients != NULL);
     assert(worker->write_queue.queue_size >= WRITE_QUEUE_DEFAULT_SIZE);
     assert(worker->write_queue.enqueu_event_fd >= 0);
+    assert(worker->client_buffer.clients != NULL);
+    assert(worker->client_buffer.clients[0].generation == 0);
 
     ServerWorkerStatus status = ServerWorkerStatusOk;
 
@@ -313,7 +349,7 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
     if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, worker->stopfd, &stop_cfg) < 0){
         ERRNO_ERROR("Failed to listen on stop signal");
         status = ServerWorkerListenError;
-        goto exit_epoll;
+        goto exit_socket;
     }
 
     struct epoll_event write_cfg = {
@@ -323,10 +359,10 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
     if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, worker->write_queue.enqueu_event_fd, &write_cfg) < 0){
         ERRNO_ERROR("Failed to listen on write signal");
         status = ServerWorkerListenError;
-        goto exit_epoll;
+        goto exit_stop_fd;
     }
 
-    LOG_INFO("Listening on port %d...", worker->port);
+    LOG_INFO("Listening on port %d...", worker->config.port);
 
     struct epoll_event events[16];
     while(true){
@@ -383,11 +419,13 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
                 continue;
             }
             else{
-                LOG_INFO("Event");
                 Client *client = event.data.ptr;
                 if(client->status == Handshake){
                     LOG_INFO("Handling data from client for handshake");
                     _handle_client_handshake(worker, client);
+                    if(client->status == Idle){
+                        _handle_client_read(worker, client);
+                    }
                 }
                 else if(client->status & (Reading | Idle)){
                     LOG_INFO("Handling data from client");
@@ -405,8 +443,12 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
     }
 
 exit_clients:
-    LOG_INFO("Stopping server worker");
     _disconnect_all_clients(worker);
+    epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->write_queue.enqueu_event_fd, NULL);
+exit_stop_fd:
+    epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->stopfd, NULL);
+exit_socket:
+    epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->socket, NULL);
 exit_epoll:
     close(worker->epollfd);
     worker->epollfd = -1;
@@ -432,10 +474,6 @@ static Client *_accept_client(ServerWorker *worker){
     if(pthread_mutex_init(&client->write_lock, 0) != 0){
         goto exit_client;
     }
-    if(pthread_cond_init(&client->no_writers_cond, 0) != 0){
-        goto exit_write_lock;
-    }
-    atomic_init(&client->writer_count, 0);
 
     LOG_DEBUG("Initialize data buffers");
     _data_buffer_initialize_empty(&client->in_flight_out_buffer);
@@ -446,7 +484,7 @@ static Client *_accept_client(ServerWorker *worker){
     client->socket = accept(worker->socket, (struct sockaddr *)&client->address, &addrlen);
     if(client->socket < 0){
         ERRNO_ERROR("Accept error");
-        goto exit_write_cond;
+        goto exit_write_lock;
     }
 
 
@@ -460,6 +498,7 @@ static Client *_accept_client(ServerWorker *worker){
     if(client->ssl == NULL){
         goto exit_error_socket;
     }
+
     if(SSL_set_fd(client->ssl, client->socket) == 0){
         SSL_ERROR("Unable to set fd");
         goto exit_ssl;
@@ -485,7 +524,6 @@ static Client *_accept_client(ServerWorker *worker){
         goto exit_ssl;
     }
 
-    LOG_DEBUG("Get IP");
     char buff[128];
     _ip_str((struct sockaddr *)&client->address, buff, sizeof(buff));
     LOG_INFO("Client with ip %s connected", buff);
@@ -494,10 +532,10 @@ static Client *_accept_client(ServerWorker *worker){
 
 exit_ssl:
     SSL_free(client->ssl);
+    client->ssl = NULL;
 exit_error_socket:
     close(client->socket);
-exit_write_cond:
-    pthread_cond_destroy(&client->no_writers_cond);
+    client->socket = -1;
 exit_write_lock:
     pthread_mutex_destroy(&client->write_lock);
 exit_client:
@@ -511,18 +549,25 @@ static void _handle_write_signal(ServerWorker *worker){
     uint64_t buff;
     read(worker->write_queue.enqueu_event_fd, &buff, sizeof(buff));
     
-    Client *write_clients[32];
-    size_t buffer_size = sizeof(write_clients)/sizeof(Client*);
+    ClientHandle write_clients[32];
+    size_t buffer_size = sizeof(write_clients)/sizeof(ClientHandle);
     size_t count = buffer_size;
     while(count == buffer_size){
-        count = _client_queue_dequeue_n(&worker->write_queue, write_clients, sizeof(write_clients) / sizeof(Client *));
+        count = _client_queue_dequeue_n(&worker->write_queue, write_clients, sizeof(write_clients) / sizeof(ClientHandle));
         LOG_INFO("Writing to %zu clients", count);
         for(size_t i = 0; i < count; i++){
-            Client *client = write_clients[i];
-            if(client->status & Idle){
-                _handle_client_write(worker, client);
-            }else{
-                LOG_DEBUG("Unable to write to client. Client in state %d. Will write later", client->status);
+            ClientHandle handle = write_clients[i];
+            Client *client = _client_buffer_get_client(worker, handle);
+            if(client == NULL){
+                LOG_INFO("Write buffer contains disconnected client, ignoring...");
+            }
+            else{
+                if(client->status & Idle){
+                    _handle_client_write(worker, client);
+                }else{
+                    LOG_DEBUG("Unable to write to client. Client in state %d. Will write later", client->status);
+                }
+                _client_buffer_release_client(worker, handle);
             }
         }
     }
@@ -538,8 +583,6 @@ static void _handle_client_write(ServerWorker *worker, Client *client){
         DataBuffer temp = client->in_flight_out_buffer;
         client->in_flight_out_buffer = client->out_buffer;
         client->out_buffer = temp;
-
-        client->out_buffer.used_size = 0;
     }
 
     if(client->in_flight_out_buffer.used_size == 0){
@@ -605,21 +648,23 @@ static void _handle_client_read(ServerWorker *worker, Client *client){
             int reason = SSL_get_error(client->ssl, read_status);
             if(reason == SSL_ERROR_ZERO_RETURN){
                 LOG_DEBUG("ZERO Return, will disconnect client");
+                _client_set_status(worker, client, Idle);
+                LOG_INFO("Flushing buffers with %zu and %zu bytes", client->in_flight_out_buffer.used_size, client->out_buffer.used_size);
+                _handle_client_write(worker, client);
                 _disconnect_and_free_client(worker, client);
                 return;
             }
             else if(reason == SSL_ERROR_WANT_READ){
-                LOG_INFO("Wait for more");
+                LOG_DEBUG("Wait for more");
                 _client_set_status(worker, client, Idle);
                 return;
             }
             else if(reason == SSL_ERROR_WANT_WRITE){
-                LOG_INFO("Wait for write");
+                LOG_DEBUG("Wait for write");
                 _client_set_status(worker, client, Reading);
                 return;
             }
             else{
-                printf("EROROR 3\n");
                 SSL_ERROR("Failed when reading from ssl client (Reason %s). Disconnecting", ERR_reason_error_string(reason));
                 _disconnect_and_free_client(worker, client);
                 return;
@@ -628,7 +673,7 @@ static void _handle_client_read(ServerWorker *worker, Client *client){
         else if(read_status == 1){
             LOG_DEBUG("%zu bytes of data received", n);
             if(worker->receivedCallback.invoke != NULL){
-                worker->receivedCallback.invoke(worker->receivedCallback.u_data, client, buff, n);
+                worker->receivedCallback.invoke(worker->receivedCallback.u_data, client->handle, buff, n);
             }
         }
         else{
@@ -639,12 +684,13 @@ static void _handle_client_read(ServerWorker *worker, Client *client){
 
 static void _disconnect_all_clients(ServerWorker *worker){
     assert(worker != NULL);
-    assert(worker->client_buffer.clients != NULL || worker->client_buffer.client_count == 0);
+    assert(worker->client_buffer.clients != NULL || worker->client_buffer.client_buffer_size == 0);
     assert(worker->epollfd > 0);
+    LOG_DEBUG("Disconnect all clients");
 
     ClientBuffer *buffer = &worker->client_buffer;
-    for(size_t i = 0; i < buffer->client_count; i++){
-        Client *client = buffer->clients[i];
+    for(size_t i = 0; i < buffer->client_buffer_size; i++){
+        Client *client = buffer->clients[i].client;
         if(client == NULL){
             continue;
         }
@@ -657,7 +703,12 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     assert(worker->epollfd > 0);
     assert(client != NULL);
     assert(client->socket > 0);
+    assert(client->handle.index < worker->client_buffer.client_buffer_size);
 
+    ClientEntry *entry = &worker->client_buffer.clients[client->handle.index];
+    assert(entry->generation == client->handle.generation);
+
+    entry->generation++;
     _client_set_status(worker, client, Stopped);
 
     pthread_mutex_t dummy;
@@ -666,13 +717,12 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     }
     else{
         pthread_mutex_lock(&dummy);
-        while(atomic_load(&client->writer_count) > 0){
-            pthread_cond_wait(&client->no_writers_cond, &dummy);
+        LOG_DEBUG("Waiting for %d writers to exit", atomic_load(&entry->accessor_count));
+        while(atomic_load(&entry->accessor_count) > 0){
+            pthread_cond_wait(&entry->no_accessors, &dummy);
         }
         pthread_mutex_unlock(&dummy);
         pthread_mutex_destroy(&dummy);
-
-        _client_queue_remove_client(&worker->write_queue, client);
     }
 
     char ipbuff[128];
@@ -684,7 +734,6 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     }       
     close(client->socket);
     client->socket = -1;
-    _client_set_status(worker, client, Stopped);
     _client_buffer_remove(&worker->client_buffer, client);
 
     _data_buffer_clear(&client->out_buffer);
@@ -695,9 +744,13 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
         client->ssl = NULL;
     }
 
-    client->buffer_index = -1;
+    client->handle = (ClientHandle){
+        .index = -1,
+        .generation = 0,
+    };
 
     free(client);
+    LOG_DEBUG("Client freed and disconnected");
 }
 
 static void _client_set_status(ServerWorker *worker, Client *client, ClientStatus status){
@@ -712,7 +765,11 @@ static void _client_set_status(ServerWorker *worker, Client *client, ClientStatu
     }
 }
 
-static SSL_CTX * _create_ssl_context(){
+static SSL_CTX * _create_ssl_context(ServerWorkerConfig *config){
+    assert(config != NULL);
+    assert(config->cert_file_path != NULL);
+    assert(config->private_key_path != NULL);
+
     const SSL_METHOD *method = TLS_server_method();
     SSL_CTX *ctx = SSL_CTX_new(method);
 
@@ -726,25 +783,13 @@ static SSL_CTX * _create_ssl_context(){
         return NULL;
     }
 
-    char *cert_file = getenv("CERT_FILE_PATH");
-    char *private_key_file = getenv("PRIVATE_KEY_FILE_PATH");
+    LOG_INFO("Using files, cert: %s, private key: %s\n", config->cert_file_path, config->private_key_path);
 
-    if(cert_file == NULL){
-        ERROR("CERT_FILE_PATH environment variable is not set");
-        goto error;
-    }
-    if(private_key_file == NULL){
-        ERROR("PRIVATE_KEY_FILE_PATH environment variable is not set");
-        goto error;
-    }
-
-    LOG_INFO("Using files, cert: %s, private key: %s\n", cert_file, private_key_file);
-
-    if(SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0){
+    if(SSL_CTX_use_certificate_file(ctx, config->cert_file_path, SSL_FILETYPE_PEM) <= 0){
         SSL_ERROR("Unable to use certificate file");
         goto error;
     }
-    if(SSL_CTX_use_PrivateKey_file(ctx, private_key_file, SSL_FILETYPE_PEM) <= 0){
+    if(SSL_CTX_use_PrivateKey_file(ctx, config->private_key_path, SSL_FILETYPE_PEM) <= 0){
         SSL_ERROR("Unable to use private key file");
         goto error;
     }
@@ -853,21 +898,38 @@ static bool _try_check_is_nonblocking(int socketfd, bool *result){
 }
 
 static bool _client_buffer_initialize(ClientBuffer *buffer){
+    LOG_DEBUG("Initialilzing client buffer");
     *buffer = (ClientBuffer){
-        .client_buffer_size = 0,
-        .client_count = CLIENT_BUFFER_DEFAULT_SIZE,
-        .clients = malloc(sizeof(Client) * CLIENT_BUFFER_DEFAULT_SIZE)
+        .client_buffer_size = CLIENT_BUFFER_DEFAULT_SIZE,
+        .clients = calloc(CLIENT_BUFFER_DEFAULT_SIZE, sizeof(ClientEntry))
     };
 
+    LOG_DEBUG("First has %lu", buffer->clients[0].generation);
     return buffer->clients != NULL;
 }
 
 static void _client_buffer_clear(ClientBuffer *buffer){
+    LOG_DEBUG("Clearing client buffer");
     if(buffer == NULL){
         return;
     }
+    if(buffer->clients == NULL){
+        return;
+    }
 
+    LOG_DEBUG("Destroying conds in client buffer");
+    for(size_t i = 0; i < buffer->client_buffer_size; i++){
+        if(buffer->clients[i].client != NULL){
+            pthread_cond_destroy(&buffer->clients[i].no_accessors);
+        }
+    }
+
+    LOG_DEBUG("Freeing client buffer");
+    buffer->client_buffer_size = 0;
     free(buffer->clients);
+    buffer->clients = NULL;
+
+    LOG_DEBUG("Client buffer cleared");
 }
 
 static bool _client_buffer_add(ClientBuffer *buffer, Client *client){
@@ -875,74 +937,109 @@ static bool _client_buffer_add(ClientBuffer *buffer, Client *client){
     assert(client != NULL);
 
     if(buffer->clients == NULL || buffer->client_buffer_size < CLIENT_BUFFER_DEFAULT_SIZE){
-        LOG_DEBUG("Invalid client buffer size. Will resize");
-        Client **new_buffer = realloc(buffer->clients, CLIENT_BUFFER_DEFAULT_SIZE * sizeof(Client *));
+        LOG_DEBUG("Invalid client buffer size (%zX, %zu). Will resize", buffer->client_buffer_size, buffer->client_buffer_size);
+        ClientEntry *new_buffer = calloc(CLIENT_BUFFER_DEFAULT_SIZE, sizeof(ClientEntry));
         if(new_buffer == NULL){
             return false;
         }
+        memcpy(new_buffer, buffer->clients, buffer->client_buffer_size * sizeof(ClientEntry));
+        free(buffer->clients);
         buffer->clients = new_buffer;
         buffer->client_buffer_size = CLIENT_BUFFER_DEFAULT_SIZE;
     }
 
-    if(buffer->client_count == buffer->client_buffer_size){
-        LOG_DEBUG("Client buffer full. Defragmenting...");
-        _client_buffer_defragment(buffer);
-        LOG_DEBUG("Client buffer defragmented.");
-        if(buffer->client_count == buffer->client_buffer_size){
-            LOG_DEBUG("Client buffer too small, resizing");
-            size_t new_size = buffer->client_count * CLIENT_BUFFER_GROWTH_RATE;
-            Client **new_buffer = realloc(buffer->clients, new_size * sizeof(Client *));
-            if(new_buffer == NULL){
-                return false;
-            }
-            buffer->clients = new_buffer;
-            buffer->client_buffer_size = new_size;
+    ssize_t free_index = -1;
+    for(size_t i = 0; i < buffer->client_buffer_size; i++){
+        if(buffer->clients[i].client == NULL){
+            free_index = i;
+            break;
         }
     }
 
-    buffer->clients[buffer->client_count] = client;
-    client->buffer_index = buffer->client_count;
-    buffer->client_count++;
+    if(free_index == -1){
+        LOG_DEBUG("Client buffer too small, resizing");
+        size_t new_size = buffer->client_buffer_size * CLIENT_BUFFER_GROWTH_RATE;
+        assert(new_size > buffer->client_buffer_size);
+        ClientEntry *new_buffer = realloc(buffer->clients, new_size * sizeof(ClientEntry));
+        if(new_buffer == NULL){
+            return false;
+        }
+        free_index = buffer->client_buffer_size;
+        buffer->clients = new_buffer;
+
+        memset(new_buffer + buffer->client_buffer_size, 0, (new_size - buffer->client_buffer_size) * sizeof(ClientEntry));
+
+        buffer->client_buffer_size = new_size;
+    }
+
+    LOG_DEBUG("Adding to client buffer at %d/%d", free_index, buffer->client_buffer_size);
+    ClientEntry *entry = &buffer->clients[free_index];
+    entry->client = client;
+    client->handle = (ClientHandle){
+        .generation = entry->generation,
+        .index = free_index
+    };
+    LOG_DEBUG("Adding at gernation %lu", entry->generation);
+    if(pthread_cond_init(&entry->no_accessors, 0) != 0){
+        entry->client = NULL;
+        ERRNO_ERROR("Unable to create \"no accessors\" condition");
+        return false;
+    }
 
     return true;
-}
-
-static void _client_buffer_defragment(ClientBuffer *buffer){
-    assert(buffer != NULL);
-    assert(buffer->clients != NULL);
-
-    size_t free_index = 0;
-    for(size_t i = 0; i < buffer->client_count; i++){
-        if(buffer->clients[i] != NULL){
-            buffer->clients[free_index] = buffer->clients[i];
-            buffer->clients[free_index]->buffer_index = free_index;
-            free_index++;
-        }
-    }
-    for(size_t i = free_index; i < buffer->client_count; i++){
-        if(buffer->clients[i] != NULL){
-            buffer->clients[i] = NULL;
-        }
-    }
-    buffer->client_count = free_index;
 }
 
 static void _client_buffer_remove(ClientBuffer *buffer, Client *client){
     assert(buffer != NULL);
     assert(buffer->clients != NULL);
     assert(client != NULL);
-    if(client->buffer_index < 0){
-        for(size_t i = 0; i  < buffer->client_count; i++){
-            if(buffer->clients[i] == client){
-                LOG_INFO("Client at %zu (%d)", i, (int)client->buffer_index);
-                break;
-            }
-        }
+    assert(client->handle.index >= 0);
+    assert(client->handle.index < buffer->client_buffer_size);
 
-        assert(client->buffer_index >= 0);
-    }
-    buffer->clients[client->buffer_index] = NULL;
+    ClientEntry *entry = &buffer->clients[client->handle.index];
+//     assert(entry->generation == client->handle.generation);
+    assert(atomic_load(&entry->accessor_count) == 0);
+
+    entry->client = NULL;
+    pthread_cond_destroy(&entry->no_accessors);
 }
+
+static Client *_client_buffer_get_client(ServerWorker *worker, ClientHandle handle){
+    assert(worker != NULL);
+    assert(worker->client_buffer.clients != NULL);
+    assert(handle.index >= 0);
+
+    if(handle.index >= worker->client_buffer.client_buffer_size){
+        return NULL;
+    }
+    ClientEntry *entry = &worker->client_buffer.clients[handle.index];
+    if(entry->generation != handle.generation){
+        return NULL;
+    }
+    atomic_fetch_add(&entry->accessor_count, 1);
+    if(entry->generation != handle.generation){
+        atomic_fetch_sub(&entry->accessor_count, 1);
+        return NULL;
+    }
+
+    return entry->client;
+}
+
+static void _client_buffer_release_client(ServerWorker *worker, ClientHandle handle){
+    assert(worker != NULL);
+    assert(worker->client_buffer.clients != NULL);
+    assert(handle.index >= 0);
+    assert(handle.index < worker->client_buffer.client_buffer_size);
+
+    ClientEntry *entry = &worker->client_buffer.clients[handle.index];
+    assert(entry->generation == handle.generation);
+
+    int prev = atomic_fetch_sub(&entry->accessor_count, 1);
+    if(prev == 1){
+        pthread_cond_signal(&entry->no_accessors);
+    }
+}
+
 
 static void _data_buffer_initialize_empty(DataBuffer *buffer){
     *buffer = (DataBuffer){
@@ -958,9 +1055,12 @@ static bool _data_buffer_initialize_with_data(DataBuffer *buffer, const char *da
         .used_size = data_len,
         .buffer_size = data_len,
     };
+    if(buffer->data == NULL){
+        return false;
+    }
 
     memcpy(buffer->data, data, data_len);
-    return buffer->data != NULL;
+    return true;
 }
 
 static void _data_buffer_clear(DataBuffer *buffer){
@@ -970,7 +1070,11 @@ static void _data_buffer_clear(DataBuffer *buffer){
 
     buffer->buffer_size = 0;
     buffer->used_size = 0;
-    free(buffer->data);
+
+    if(buffer->data != NULL){
+        free(buffer->data);
+        buffer->data = NULL;
+    }
 }
 
 static bool _data_buffer_add(DataBuffer *buffer, const char *data, size_t data_len){
@@ -1001,7 +1105,7 @@ static bool _data_buffer_add(DataBuffer *buffer, const char *data, size_t data_l
 bool _client_queue_initialize(ClientQueue *queue){
     assert(queue != NULL);
     *queue = (ClientQueue){
-        .clients = malloc(WRITE_QUEUE_DEFAULT_SIZE * sizeof(Client *)),
+        .clients = malloc(WRITE_QUEUE_DEFAULT_SIZE * sizeof(ClientHandle)),
         .queue_size = WRITE_QUEUE_DEFAULT_SIZE,
         .dequeue = 0,
         .enqueue = 0,
@@ -1042,10 +1146,9 @@ static void _client_queue_clear(ClientQueue *queue){
     };
 }
 
-static bool _client_queue_enqueue(ClientQueue *queue, Client *client){
+static bool _client_queue_enqueue(ClientQueue *queue, ClientHandle client){
     assert(queue != NULL);
     assert(queue->enqueu_event_fd >= 0);
-    assert(client != NULL);
 
     pthread_mutex_lock(&queue->lock);
 
@@ -1084,7 +1187,7 @@ static bool _client_queue_resize_without_lock(ClientQueue *queue, size_t size){
     if(queue->clients == NULL || queue->queue_size == 0){
         assert(queue->dequeue == 0);
         assert(queue->enqueue == 0);
-        Client **clients = realloc(queue->clients, size * sizeof(Client *));
+        ClientHandle *clients = realloc(queue->clients, size * sizeof(ClientHandle));
         if(clients == NULL){
             return false;
         }
@@ -1093,21 +1196,21 @@ static bool _client_queue_resize_without_lock(ClientQueue *queue, size_t size){
         return true;
     }
 
-    Client **new_buff = malloc(size * sizeof(Client *));
+    ClientHandle *new_buff = malloc(size * sizeof(ClientHandle));
     if(new_buff == NULL){
         return false;
     }
     size_t client_count = 0;
     if(queue->dequeue <= queue->enqueue){
         client_count = queue->enqueue - queue->dequeue;
-        memcpy(new_buff, queue->clients + queue->dequeue, client_count * sizeof(Client *));
+        memcpy(new_buff, queue->clients + queue->dequeue, client_count * sizeof(ClientHandle));
     }
     else{
         size_t after_wrap_count = queue->enqueue;
         size_t before_wrap_count = queue->queue_size - queue->dequeue;
         client_count = after_wrap_count + before_wrap_count;
-        memcpy(new_buff, queue->clients + queue->dequeue, before_wrap_count * sizeof(Client *));
-        memcpy(new_buff + before_wrap_count, queue->clients, after_wrap_count * sizeof(Client *));
+        memcpy(new_buff, queue->clients + queue->dequeue, before_wrap_count * sizeof(ClientHandle));
+        memcpy(new_buff + before_wrap_count, queue->clients, after_wrap_count * sizeof(ClientHandle));
     }
 
     queue->dequeue = 0;
@@ -1118,57 +1221,26 @@ static bool _client_queue_resize_without_lock(ClientQueue *queue, size_t size){
     return true;
 }
 
-static bool _client_queue_dequeue(ClientQueue *queue, Client **result){
+static bool _client_queue_dequeue(ClientQueue *queue, ClientHandle *result){
     assert(queue != NULL);
     assert(result != NULL);
     assert(queue->clients != NULL);
+
+    pthread_mutex_lock(&queue->lock);
+
+    if(queue->enqueue == queue->dequeue){
+        pthread_mutex_unlock(&queue->lock);
+        return false;
+    }
     
-    pthread_mutex_lock(&queue->lock);
-    *result = NULL;
-    while(*result == NULL && queue->dequeue != queue->enqueue){
-        *result = queue->clients[queue->dequeue];
-        queue->dequeue = (queue->dequeue + 1) % queue->queue_size;
-    }
+    *result = queue->clients[queue->dequeue];
+    queue->dequeue = (queue->dequeue + 1) % queue->queue_size;
     pthread_mutex_unlock(&queue->lock);
-    return *result != NULL;
+
+    return true;
 }
 
-static void _client_queue_remove_client(ClientQueue *queue, Client *client){
-    assert(queue != NULL);
-    assert(client != NULL);
-    pthread_mutex_lock(&queue->lock);
-    if(queue->dequeue < queue->enqueue){
-        for(size_t i = queue->dequeue; i < queue->enqueue; i++){
-            if(queue->clients[i] == client){
-                queue->clients[i] = NULL;
-            }
-        }
-    }else{
-        for(size_t i = queue->dequeue; i < queue->queue_size; i++){
-            if(queue->clients[i] == client){
-                queue->clients[i] = NULL;
-            }
-        }
-        for(size_t i = 0; i < queue->enqueue; i++){
-            if(queue->clients[i] == client){
-                queue->clients[i] = NULL;
-            }
-        }
-    }
-    pthread_mutex_unlock(&queue->lock);
-}
-
-static size_t _defragment_client_array(Client **clients, size_t size){
-    size_t free_index;
-    for(size_t i = 0; i < size; i++){
-        if(clients[i] != NULL){
-            clients[free_index++] = clients[i];
-        }
-    }
-    return free_index;
-}
-
-static size_t _client_queue_dequeue_n(ClientQueue *queue, Client **result, size_t buffer_size){
+static size_t _client_queue_dequeue_n(ClientQueue *queue, ClientHandle *result, size_t buffer_size){
     assert(queue != NULL);
     assert(result != NULL);
 
@@ -1181,25 +1253,25 @@ static size_t _client_queue_dequeue_n(ClientQueue *queue, Client **result, size_
 
     if(queue->dequeue < queue->enqueue){
         size_t count = min(queue->enqueue - queue->dequeue, buffer_size);
-        memcpy(result, queue->clients + queue->dequeue, count * sizeof(Client *));
+        memcpy(result, queue->clients + queue->dequeue, count * sizeof(ClientHandle));
         queue->dequeue = (queue->dequeue + count) % queue->queue_size;
         pthread_mutex_unlock(&queue->lock);
-        return _defragment_client_array(result, count);
+        return count;
     }
     else{
         size_t after_wrap_count = queue->enqueue;
         size_t before_wrap_count = queue->queue_size - queue->dequeue;
 
         size_t count = min(before_wrap_count, buffer_size);
-        memcpy(result, queue->clients + queue->dequeue, min(before_wrap_count, buffer_size) * sizeof(Client *));
+        memcpy(result, queue->clients + queue->dequeue, min(before_wrap_count, buffer_size) * sizeof(ClientHandle));
 
         if(buffer_size > before_wrap_count){
-            memcpy(result + before_wrap_count, queue->clients, min(after_wrap_count, buffer_size - before_wrap_count) * sizeof(Client *));
+            memcpy(result + before_wrap_count, queue->clients, min(after_wrap_count, buffer_size - before_wrap_count) * sizeof(ClientHandle));
             count += min(after_wrap_count, buffer_size - before_wrap_count);
         }
         queue->dequeue = (queue->dequeue + count) % queue->queue_size;
         pthread_mutex_unlock(&queue->lock);
 
-        return _defragment_client_array(result, count);
+        return count;
     }
 }

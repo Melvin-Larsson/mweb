@@ -1,0 +1,4 @@
+{
+  "/index.html": ["/hello-world.html", "/advanced-administration/wordpress/wp-config"],
+  "/style.css": ["/advanced-administration/wordpress/style.css"]
+}
