@@ -4,6 +4,20 @@
 #include <string.h>
 #include "http2/http2_logging.h"
 
+InternalDataFrame http2_frame_create_data_frame(uint8_t *data, size_t size, uint32_t stream_id){
+    assert(stream_id != 0);
+
+    return (InternalDataFrame){
+        .header = (InternalFrameHeader){
+            .flags = 0,
+            .stream_id = stream_id,
+            .type = Data
+        },
+        .data = (char *)data,
+        .size = size
+    };
+}
+
 ParseStatus http2_frame_parse_data_frame(ParseBuffer *buffer, InternalDataFrame *result){
     InternalFrameHeader header;
     Payload payload_info;
@@ -29,7 +43,7 @@ ParseStatus http2_frame_parse_data_frame(ParseBuffer *buffer, InternalDataFrame 
     return ParseStatusSuccess;
 }
 
-size_t http2_serialize_data_frame(char *buffer, size_t len, InternalDataFrame *frame){
+size_t http2_frame_serialize_data_frame(char *buffer, size_t len, InternalDataFrame *frame){
     assert((frame->header.flags & ~( END_STREAM | PADDED )) == 0);
 
     frame->header.type = Data;

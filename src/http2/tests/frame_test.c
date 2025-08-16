@@ -3,7 +3,7 @@
 #include <string.h>
 
 static void _print_parse_buffer(ParseBuffer buffer){
-    for(size_t i = 0; i < buffer.data_length; i++){
+    for(size_t i = 0; i < buffer.total_size; i++){
         printf("%X ", (uint8_t)buffer.data[i]);
     }
     printf("\n");
@@ -27,15 +27,15 @@ bool data_frame_serialize_deserialize(){
     };
 
     //Act
-    size_t used_size = http2_serialize_data_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    size_t used_size = http2_frame_serialize_data_frame(buff, sizeof(buff), &expected);
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalDataFrame actual;
     ParseStatus status = http2_frame_parse_data_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, 9 + sizeof(data));
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -68,14 +68,14 @@ bool header_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_header_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalHeaderFrame actual;
     ParseStatus status = http2_frame_parse_header_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, 14 + sizeof(header_block_fragment));
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -104,13 +104,13 @@ bool priority_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_priority_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalPriorityFrame actual;
     ParseStatus status = http2_frame_parse_priority_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -136,7 +136,7 @@ bool rst_stream_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_rst_stream_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalRstStreamFrame actual;
     ParseStatus status = http2_frame_parse_rst_stream_frame(&buffer, &actual);
 
@@ -176,7 +176,7 @@ bool settings_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_settings_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalSettingsFrame actual;
     ParseStatus status = http2_frame_parse_settings_frame(&buffer, &actual);
 
@@ -219,14 +219,14 @@ bool push_promise_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_push_promise_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalPushPromiseFrame actual;
     ParseStatus status = http2_frame_parse_push_promise_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, 13 + sizeof(data));
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -254,14 +254,14 @@ bool ping_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_ping_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalPingFrame actual;
     ParseStatus status = http2_frame_parse_ping_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, 9 + sizeof(data));
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -290,14 +290,14 @@ bool goaway_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_goaway_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalGoAwayFrame actual;
     ParseStatus status = http2_frame_parse_goaway_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, 17 + sizeof(data));
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -322,14 +322,14 @@ bool window_update_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_serialize_window_update_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalWindowUpdateFrame actual;
     ParseStatus status = http2_frame_parse_window_update_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, (size_t)13);
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);
@@ -358,14 +358,14 @@ bool continuation_frame_serialize_deserialize(){
 
     //Act
     size_t used_size = http2_frame_serialize_continuation_frame(buff, sizeof(buff), &expected);
-    ParseBuffer buffer = {.data = buff, .data_length = used_size, .parsed_length = 0};
+    ParseBuffer buffer = {.data = buff, .total_size = used_size, .parsed_size = 0};
     InternalContinuationFrame actual;
     ParseStatus status = http2_frame_parse_continuation_frame(&buffer, &actual);
 
     //Assert
     ASSERT_INT_EQUAL(ParseStatusSuccess, status);
     ASSERT_SIZE_EQUAL(used_size, 9 + sizeof(data));
-    ASSERT_SIZE_EQUAL(buffer.data_length, buffer.parsed_length);
+    ASSERT_SIZE_EQUAL(buffer.total_size, buffer.parsed_size);
     ASSERT_INT_EQUAL(expected.header.flags, actual.header.flags);
     ASSERT_INT_EQUAL(expected.header.stream_id, actual.header.stream_id);
     ASSERT_INT_EQUAL(expected.header.type, actual.header.type);

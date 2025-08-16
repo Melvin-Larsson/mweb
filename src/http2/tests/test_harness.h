@@ -26,13 +26,22 @@ int main(void){
     bool success = true;
     for(size_t i = 0; i < test_count; i++){
         Test test = tests[i];
-        printf(COLOR_WHITE "[Running] %s\n" COLOR_RESET, test.name);
+        printf(COLOR_WHITE "[Running] %s" COLOR_RESET, test.name);
+        fflush(stdout);
         bool test_status = test.run();
+        printf("\r\033[K");
         if (test_status) {
             printf(COLOR_GREEN "[PASSED] %s\n" COLOR_RESET, test.name);
         } else {
             printf(COLOR_RED "[FAILED] %s\n" COLOR_RESET, test.name);
-        }success = success && test_status;
+        }
+        success = success && test_status;
+    }
+
+    if (success) {
+        printf(COLOR_GREEN "Tests passed! \n" COLOR_RESET);
+    } else {
+        printf(COLOR_RED "Tests failed \n" COLOR_RESET);
     }
 
     return success ? 0 : 1;

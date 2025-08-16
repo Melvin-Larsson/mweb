@@ -35,7 +35,11 @@ void server_worker_free(ServerWorker *worker);
 
 void server_worker_set_ssl_ctx_cb(ServerWorker *worker, bool (*callback)(void *u_data, SSL_CTX *ctx ), void *u_data);
 
-void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client, char *received, size_t size), void *u_data);
+void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, void *u_client_data, const ClientHandle client, char *received, size_t size), void *u_data);
+void server_worker_set_connect_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client), void *u_data);
+void server_worker_set_disconnect_callback(ServerWorker *worker, void (*callback)(void *u_data, void * u_client_data, const ClientHandle client), void *u_data);
+
+ServerWorkerStatus server_worker_attach_client_data(ServerWorker *worker, const ClientHandle client, void *u_client_data);
 
 ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle client, char *buffer, size_t buffer_size);
 

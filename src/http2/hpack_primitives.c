@@ -1,6 +1,6 @@
 #include "hpack_primitives.h"
-#include "http2/http2_logging.h"
 #include "http2/huffman.h"
+#include "http2_logging.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,43 +8,56 @@
 #define BITMASK(n) ((1U << (n)) - 1U)
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
-bool hpack_primitives_try_decode_int(unsigned char *bytes, size_t size, uint8_t prefix_length, unsigned int *result){
+bool hpack_primitives_try_decode_int(ParseBuffer *buffer, uint8_t prefix_length, unsigned int *result){
     assert(prefix_length <= 8);
 
-    uint8_t prefix = BITMASK(prefix_length) & bytes[0];
+    if(buffer->parsed_size >= buffer->total_size){
+        return false;
+    }
+
+    uint8_t prefix = BITMASK(prefix_length) & buffer->data[buffer->parsed_size];
     if(prefix < BITMASK(prefix_length)){
+        buffer->parsed_size++;
         *result = prefix;
         return true;
     }
 
     int res = prefix;
-    for(size_t i = 1; i < size; i++){
-        res += (bytes[i] & ~(1 << 7)) << (i - 1) * 7;
+    for(size_t i = 1; i < buffer->total_size - buffer->parsed_size; i++){
+        res += (buffer->data[buffer->parsed_size + i] & ~(1 << 7)) << (i - 1) * 7;
 
-        if((bytes[i] & (1 << 7)) == 0){
+        if((buffer->data[buffer->parsed_size + i] & (1 << 7)) == 0){
+            buffer->parsed_size += i + 1;
             *result = res;
             return true;
         }
     }
+
     return false;
 }
 
-size_t hpack_primitives_encode_int(unsigned char *bytes, size_t size, uint8_t prefix_length, unsigned int value){
+size_t hpack_primitives_encode_int(Buffer *buffer, uint8_t prefix_length, unsigned int value){
     assert(prefix_length <= 8);
-    assert(bytes != NULL);
+    assert(buffer != NULL);
+    assert(buffer->data != NULL);
 
-    if(size == 0){
+    if(buffer->used_size >= buffer->total_size){
         return 0;
     }
 
+    size_t initial_used_size = buffer->used_size;
+    uint8_t *bytes = &buffer->data[buffer->used_size];
     if(value < BITMASK(prefix_length)){
         bytes[0] = (bytes[0] & ~BITMASK(prefix_length) | value);
+        buffer->used_size++;
         return 1;
     }
 
     bytes[0] |= BITMASK(prefix_length);
+    buffer->used_size++;
     value -= BITMASK(prefix_length);
-    for(size_t i = 1; i < size; i++){
+    for(size_t i = 1; buffer->used_size < buffer->total_size; i++){
+        buffer->used_size++;
         if(value >= 128){
             bytes[i] = (value & 0x7F) | (1 << 7);
             value >>= 7;
@@ -55,67 +68,64 @@ size_t hpack_primitives_encode_int(unsigned char *bytes, size_t size, uint8_t pr
         }
     }
 
-    return size;
+    return buffer->used_size - initial_used_size;
 }
 
-size_t hpack_primitives_get_int_length(unsigned int value, uint8_t prefix_length){
-    unsigned char buff[64];
-    size_t size = hpack_primitives_encode_int(buff, sizeof(buff), prefix_length, value);
-    assert(size != sizeof(buff) && "Too little buffer space to encode int");
-    return size;
-}
-
-bool hpack_primitives_try_decode_string(char *bytes, size_t size, char *result, size_t max_result_size, size_t *actual_result_size){
+bool hpack_primitives_try_decode_string(ParseBuffer *buffer, Buffer *result, size_t *result_size){
+    size_t initial_parsed_size = buffer->parsed_size;
     unsigned int str_length;
-    if(!hpack_primitives_try_decode_int((unsigned char *)bytes, size, 7, &str_length)){
+    if(!hpack_primitives_try_decode_int(buffer, 7, &str_length)){
+        return false;
+    }
+    if(buffer->parsed_size + str_length > buffer->total_size){
+        buffer->parsed_size = initial_parsed_size;
         return false;
     }
 
-    unsigned char buff[64];
-    size_t length_field_size = hpack_primitives_encode_int(buff, sizeof(buff), 7, str_length);
-    if(length_field_size == sizeof(buff)){
-        ERROR("Unexpected length for field");
-        return false;
-    }
-
-    if(str_length + length_field_size > size){
-        return false;
-    }
-
-    char *str_ptr = bytes + length_field_size;
-
-    bool is_huffman_encoded = (bytes[0] & (1 << 7)) == 0 ? false : true;
+    bool is_huffman_encoded = (buffer->data[initial_parsed_size] & (1 << 7)) == 0 ? false : true;
+    uint8_t *str_ptr = &buffer->data[buffer->parsed_size];
+    size_t buffer_space = result->total_size - result->used_size;
     if(is_huffman_encoded){
-        printf("is huffman\n");
-        return huffman_decode(str_ptr, str_length * 8, result, max_result_size, actual_result_size);
+        if(!huffman_decode(str_ptr, str_length * 8, &result->data[result->used_size], buffer_space, result_size)){
+            buffer->parsed_size = initial_parsed_size;
+            return false;
+        }
+        buffer->parsed_size += str_length;
+        result->used_size += *result_size;
     }
     else{
-        *actual_result_size = min(max_result_size, str_length);
-        memcpy(result, str_ptr, *actual_result_size);
+        *result_size = min(buffer_space, str_length);
+        memcpy(&result->data[result->used_size], str_ptr, *result_size);
+        buffer->parsed_size += *result_size;
+        result->used_size += *result_size;
     }
 
     return true;
 }
 
-size_t hpack_primitives_encode_string(const char *str, size_t len, char *buffer, size_t buffer_size){
-    if(buffer_size == 0){
+size_t hpack_primitives_encode_string(Buffer *buffer, const char *str, size_t len){
+    if(buffer->used_size >= buffer->total_size){
         return 0;
     }
-    *buffer = 0;
-    size_t length_field_size = hpack_primitives_encode_int((unsigned char *)buffer, buffer_size, 7, len);
 
-    if(length_field_size >= buffer_size){
-        return length_field_size;
+    size_t initial_used_size = buffer->used_size;
+    buffer->data[buffer->used_size] = 0;
+    hpack_primitives_encode_int(buffer, 7, len);
+
+    if(buffer->used_size >= buffer->total_size){
+        return 0;
     }
 
-    size_t actual_str_length = min(buffer_size - length_field_size, len);
-    memcpy(buffer + length_field_size, str, actual_str_length);
+    size_t actual_str_length = min(buffer->total_size - buffer->used_size, len);
+    memcpy(&buffer->data[buffer->used_size], str, actual_str_length);
+    buffer->used_size += actual_str_length;
 
-    return length_field_size + actual_str_length;
+    return buffer->used_size - initial_used_size;
 }
 
-HeaderFieldType hpack_primitives_get_header_field_type(char *bytes, size_t size){
-    assert(size > 0);
+HeaderFieldType hpack_primitives_get_header_field_type(const ParseBuffer *buffer){
+    assert(buffer->total_size - buffer->parsed_size > 0);
+    uint8_t *bytes = &buffer->data[buffer->parsed_size];
 
     if(bytes[0] >> 7 == 1){
         return HeaderFieldIndexed;
@@ -134,103 +144,119 @@ HeaderFieldType hpack_primitives_get_header_field_type(char *bytes, size_t size)
     return HeaderFieldUnknown;
 }
 
-HeaderFieldIndexType hpack_primitives_get_header_field_index_type(char *bytes, size_t size){
-    assert(size > 0);
-    HeaderFieldType type = hpack_primitives_get_header_field_type(bytes, size);
-    assert(type == HeaderFieldLiteralFieldNewName || type == HeaderFieldLiteralFieldNewName);
+HeaderFieldIndexType hpack_primitives_get_header_field_index_type(const ParseBuffer *buffer){
+    assert(buffer->total_size - buffer->parsed_size > 0);
+    HeaderFieldType type = hpack_primitives_get_header_field_type(buffer);
+    assert(type == HeaderFieldLiteralFieldIndexedName || type == HeaderFieldLiteralFieldNewName);
 
-    if(bytes[0] >> 6 == 0b01){
+    if(buffer->data[buffer->parsed_size] >> 6 == 0b01){
         return IndexTypeIncremental;
     }
-    if (bytes[0] >> 4 == 0){
+    if (buffer->data[buffer->parsed_size] >> 4 == 0){
         return IndexTypeWithout;
     }
-    if (bytes[0] >> 4 == 0b1){
+    if (buffer->data[buffer->parsed_size] >> 4 == 0b1){
         return IndexTypeNever;
     }
 
     return IndexTypeUnknown;
 }
 
-bool hpack_primitives_try_decode_indexed_header_field(char *bytes, size_t size, HpackHeaderFieldIndexed *result, size_t *used_size){
-    assert(hpack_primitives_get_header_field_type(bytes, size) == HeaderFieldIndexed);
-
-    if(!hpack_primitives_try_decode_int((uint8_t *)bytes, size, 7, &result->index)){
-        return false;
+size_t hpack_primitives_encode_header_field(HeaderFieldIndexType type, unsigned int index, Buffer *result){
+    if(result->used_size >= result->total_size){
+        return 0;
     }
-    used_size = hpack_primitives_get_int_length(result->index, 7);
-    return true;
+    switch(type){
+        case IndexTypeIncremental:
+            result->data[result->used_size] = 0b01000000;
+            return hpack_primitives_encode_int(result, 6, index);
+        case IndexTypeWithout:
+            result->data[result->used_size] = 0;
+            return hpack_primitives_encode_int(result, 4, index);
+        case IndexTypeNever:
+            result->data[result->used_size] = 0b00010000;
+            return hpack_primitives_encode_int(result, 4, index);
+        case IndexTypeUnknown:
+            assert(false);
+    }
 }
 
-bool hpack_primitives_try_decode_liternal_field_indexed_name(char *bytes, size_t size, HpackHeaderLiteralFieldIndexedName *result, size_t *used_size){
-    assert(hpack_primitives_get_header_field_type(bytes, size) == HeaderFieldLiteralFieldIndexedName);
+bool hpack_primitives_try_decode_indexed_header_field(ParseBuffer *buffer, HpackHeaderFieldIndexed *result){
+    assert(hpack_primitives_get_header_field_type(buffer) == HeaderFieldIndexed);
 
-    result->index_type = hpack_primitives_get_header_field_index_type(bytes, size);
+    if(!hpack_primitives_try_decode_int(buffer, 7, &result->index)){
+        return false;
+    }
+    return true;
+}
+size_t hpack_primitives_encode_indexed_header_field(const HpackHeaderFieldIndexed *field, Buffer *result){
+    if(result->used_size >= result->total_size){
+        return 0;
+    }
+
+    result->data[result->used_size] = 0x80;
+    return hpack_primitives_encode_int(result, 7, field->index);
+}
+
+bool hpack_primitives_try_decode_literal_field_indexed_name(ParseBuffer *buffer, HpackHeaderLiteralFieldIndexedName *result, Buffer *field_buffer){
+    assert(hpack_primitives_get_header_field_type(buffer) == HeaderFieldLiteralFieldIndexedName);
+
+    size_t initial_parsed_size = buffer->parsed_size;
+    result->index_type = hpack_primitives_get_header_field_index_type(buffer);
+    if(result->index_type == IndexTypeUnknown){
+        ERROR("Unknown index type");
+        return false;
+    }
+
+    if(!hpack_primitives_try_decode_int(buffer, 6, &result->index)){
+        ERROR("Unable to decode index");
+        return false;
+    }
+
+    result->value = (char *)&field_buffer->data[field_buffer->used_size];
+    if(!hpack_primitives_try_decode_string(buffer, field_buffer, &result->value_length)){
+        ERROR("Unable to decode string");
+        buffer->parsed_size = initial_parsed_size;
+        return false;
+    }
+
+    return true;
+}
+size_t hpack_primitives_encode_literal_field_indexed_name(const HpackHeaderLiteralFieldIndexedName *header, Buffer *result){
+    size_t size = hpack_primitives_encode_header_field(header->index_type, header->index, result);
+    size += hpack_primitives_encode_string(result, header->value, header->value_length);
+    return size;
+}
+
+bool hpack_primitives_try_decode_literal_field_new_name(ParseBuffer *buffer, HpackHeaderLiteralFieldNewName *result, Buffer *field_buffer){
+    assert(hpack_primitives_get_header_field_type(buffer) == HeaderFieldLiteralFieldNewName);
+
+    size_t initial_parsed_size = buffer->parsed_size;
+    size_t initial_field_buffer_used_size = field_buffer->used_size;
+    result->index_type = hpack_primitives_get_header_field_index_type(buffer);
     if(result->index_type == IndexTypeUnknown){
         return false;
     }
 
-    if(!hpack_primitives_try_decode_int((uint8_t *)bytes, size, 6, &result->index)){
-        return false;
-    }
-    size_t int_length = hpack_primitives_get_int_length(result->index, 6);
-
-    if(size <= int_length){
-        return false;
-    }
-
-    char buff[1024];
-    if(!hpack_primitives_try_decode_string(bytes + int_length, size - int_length, buff, sizeof(buff), &result->value_length)){
-        return false;
-    }
-    if(result->value_length == sizeof(buff)){
+    buffer->parsed_size++;
+    result->name = (char *)&field_buffer->data[field_buffer->used_size];
+    if(!hpack_primitives_try_decode_string(buffer, field_buffer, &result->name_length)){
+        buffer->parsed_size = initial_parsed_size;
         return false;
     }
 
-    result->value = malloc(result->value_length);
-    if(!result->value){
+    result->value = (char *)&field_buffer->data[field_buffer->used_size];
+    if(!hpack_primitives_try_decode_string(buffer, field_buffer, &result->value_length)){
+        buffer->parsed_size = initial_parsed_size;
+        field_buffer->used_size = initial_field_buffer_used_size;
         return false;
     }
-    memcpy(result->value, buff, result->value_length);
 
     return true;
 }
-
-bool hpack_primitives_try_decode_liternal_field_new_name(char *bytes, size_t size, HpackHeaderLiteralFieldNewName *result){
-    assert(hpack_primitives_get_header_field_type(bytes, size) == HeaderFieldLiteralFieldNewName);
-
-    result->index_type = hpack_primitives_get_header_field_index_type(bytes, size);
-    if(result->index_type == IndexTypeUnknown){
-        return false;
-    }
-
-    char buff[1024];
-    if(!hpack_primitives_try_decode_string(bytes + 1, size - 1, buff, sizeof(buff), &result->name_length)){
-        return false;
-    }
-    if(result->name_length == sizeof(buff)){
-        return false;
-    }
-    result->name = malloc(result->name_length);
-    if(!result->name){
-        return false;
-    }
-    memcpy(result->name, buff, result->name_length);
-
-    if(!hpack_primitives_try_decode_string(bytes + 1 + result->name_length, size - 1 - result->name_length, buff, sizeof(buff), &result->value_length)){
-        free(result->name);
-        return false;
-    }
-    if(result->value_length == sizeof(buff)){
-        free(result->name);
-        return false;
-    }
-    result->value = malloc(result->value_length);
-    if(!result->value){
-        free(result->name);
-        return false;
-    }
-    memcpy(result->value, buff, result->value_length);
-
-    return true;
+size_t hpack_primitives_encode_literal_field_new_name(const HpackHeaderLiteralFieldNewName *header, Buffer *result){
+    size_t size = hpack_primitives_encode_header_field(header->index_type, 0, result);
+    size += hpack_primitives_encode_string(result, header->name, header->name_length);
+    size += hpack_primitives_encode_string(result, header->value, header->value_length);
+    return size;
 }

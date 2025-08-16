@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "buffers.h"
+
 #define END_STREAM 0x1
 #define END_HEADERS 0x4
 #define PADDED 0x8
@@ -149,15 +151,14 @@ typedef struct{
     size_t header_block_fragment_size;
 }InternalContinuationFrame;
 
-typedef struct{
-    char *data;
-    size_t parsed_length;
-    size_t data_length;
-}ParseBuffer;
+bool http2_frame_try_get_stream_id(uint8_t *buff, size_t len, uint32_t *stream_id);
+bool http2_frame_try_get_length(uint8_t *buff, size_t buffer_size, size_t *length);
 
+InternalDataFrame http2_frame_create_data_frame(uint8_t *data, size_t size, uint32_t stream_id);
 ParseStatus http2_frame_parse_data_frame(ParseBuffer *buffer, InternalDataFrame *result);
-size_t http2_serialize_data_frame(char *buffer, size_t size, InternalDataFrame *frame);
+size_t http2_frame_serialize_data_frame(char *buffer, size_t size, InternalDataFrame *frame);
 
+InternalHeaderFrame http2_frame_create_header_frame(uint8_t *header_block_fragment, size_t size, size_t stream_id, bool is_last);
 ParseStatus http2_frame_parse_header_frame(ParseBuffer *buffer, InternalHeaderFrame *result);
 size_t http2_frame_serialize_header_frame(char *buffer, size_t size, InternalHeaderFrame *frame);
 
@@ -167,6 +168,8 @@ size_t http2_frame_serialize_priority_frame(char *buffer, size_t size, InternalP
 ParseStatus http2_frame_parse_rst_stream_frame(ParseBuffer *buffer, InternalRstStreamFrame *result);
 size_t http2_frame_serialize_rst_stream_frame(char *buffer, size_t size, InternalRstStreamFrame *frame);
 
+InternalSettingsFrame http2_frame_create_empty_settings_frame();
+InternalSettingsFrame http2_frame_create_ack_settings_frame();
 ParseStatus http2_frame_parse_settings_frame(ParseBuffer *buffer, InternalSettingsFrame *result);
 size_t http2_frame_serialize_settings_frame(char *buffer, size_t size, InternalSettingsFrame *frame);
 

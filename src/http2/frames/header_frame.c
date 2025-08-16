@@ -3,6 +3,18 @@
 #include "assert.h"
 #include <string.h>
 
+InternalHeaderFrame http2_frame_create_header_frame(uint8_t *header_block_fragment, size_t size, size_t stream_id, bool is_last){
+    return (InternalHeaderFrame){
+        .header = {
+            .flags = is_last ? END_HEADERS : 0,
+            .stream_id = stream_id,
+            .type = Headers
+        },
+        .header_block_fragment = (char *)header_block_fragment,
+        .header_block_size = size,
+    };
+}
+
 ParseStatus http2_frame_parse_header_frame(ParseBuffer *buffer, InternalHeaderFrame *result){
     InternalFrameHeader header;
     Payload payload_info;
@@ -50,15 +62,17 @@ size_t http2_frame_serialize_header_frame(char *buffer, size_t size, InternalHea
     }
 
     Payload payload_info;
+    printf("Serialize of size %zu\n", payload_size);
     size_t used_size = http2_frame_serialize_padded_frame(buffer, size, payload_size, 0, &frame->header, &payload_info);
 
     size_t priority_size = 0;
     if(frame->header.flags & PRIORITY){
-        priority_size = http2_frame_serialize_priority_data(payload_info.data, payload_info.size, &frame->priority);
+        priority_size = http2_frame_serialize_priority_data((char *)payload_info.data, payload_info.size, &frame->priority);
         payload_info.size -= priority_size;
         payload_info.data += priority_size;
     }
 
+    printf("PI size %zu\n", payload_info.size);
     memcpy(payload_info.data, frame->header_block_fragment, payload_info.size);
 
     return used_size;

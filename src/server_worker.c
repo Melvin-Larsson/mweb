@@ -55,6 +55,7 @@ typedef struct{
 }DataBuffer;
 
 typedef struct{
+    bool has_been_connected;
     volatile ClientStatus status;
 
     pthread_mutex_t write_lock;
@@ -67,6 +68,7 @@ typedef struct{
     DataBuffer in_flight_out_buffer;
     DataBuffer out_buffer;
 
+    void *u_client_data;
     ClientHandle handle;
 }Client;
 
@@ -93,8 +95,18 @@ typedef struct{
 
 typedef struct{
     void *u_data;
-    void (*invoke)(void *u_data, const ClientHandle client, char *received, size_t size);
+    void (*invoke)(void *u_data, void *u_client_data, const ClientHandle client, char *received, size_t size);
 }ReceivedCallback;
+
+typedef struct{
+    void *u_data;
+    void (*invoke)(void *u_data, const ClientHandle client);
+}ConnectCallback;
+
+typedef struct{
+    void *u_data;
+    void (*invoke)(void *u_data, void *u_client_data, const ClientHandle client);
+}DisconnectCallback;
 
 typedef struct{
     void *u_data;
@@ -110,6 +122,9 @@ struct ServerWorker{
     ClientBuffer client_buffer;
 
     ReceivedCallback receivedCallback;
+    ConnectCallback connectCallback;
+    DisconnectCallback disconnectCallback;
+
     ConfigureSSLCtxCallback sslCtxCallback;
 
     ClientQueue write_queue;
@@ -179,6 +194,8 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
         .socket = -1,
         .epollfd = -1,
         .receivedCallback = {NULL, NULL},
+        .connectCallback = {NULL, NULL},
+        .disconnectCallback = {NULL, NULL},
         .config = config_copy
     };
 
@@ -206,12 +223,34 @@ exit_worker:
     return NULL;
 }
 
-void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client, char *received, size_t size), void *u_data){
+void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, void *u_client_data, const ClientHandle client, char *received, size_t size), void *u_data){
     worker->receivedCallback = (ReceivedCallback){
         .u_data = u_data,
         .invoke = callback
     };
 }
+void server_worker_set_connect_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client), void *u_data){
+    worker->connectCallback = (ConnectCallback){
+        .u_data = u_data,
+        .invoke = callback
+    };
+}
+void server_worker_set_disconnect_callback(ServerWorker *worker, void (*callback)(void *u_data, void * u_client_data, const ClientHandle client), void *u_data){
+    worker->disconnectCallback = (DisconnectCallback){
+        .u_data = u_data,
+        .invoke = callback
+    };
+}
+ServerWorkerStatus server_worker_attach_client_data(ServerWorker *worker, const ClientHandle handle, void *u_client_data){
+    Client *client = _client_buffer_get_client(worker, handle);
+    if(client == NULL){
+        return ServerWorkerClientDisconnected;
+    }
+    client->u_client_data = u_client_data;
+    _client_buffer_release_client(worker, handle);
+    return ServerWorkerStatusOk;
+}
+
 void server_worker_set_ssl_ctx_cb(ServerWorker *worker, bool (*callback)(void *u_data, SSL_CTX *ctx ), void *u_data){
     worker->sslCtxCallback = (ConfigureSSLCtxCallback){
         .u_data = u_data,
@@ -467,8 +506,10 @@ static Client *_accept_client(ServerWorker *worker){
         return NULL;
     }
     *client = (Client){
+        .has_been_connected = false,
         .ssl = NULL,
         .socket = -1,
+        .u_client_data = NULL,
     };
 
     if(pthread_mutex_init(&client->write_lock, 0) != 0){
@@ -504,6 +545,11 @@ static Client *_accept_client(ServerWorker *worker){
         goto exit_ssl;
     }
 
+    if(!_client_buffer_add(&worker->client_buffer, client)){
+        ERROR("Unable to store client in buffer. Disconnecting client");
+        goto exit_ssl;
+    }
+
     LOG_DEBUG("Perform SSL handshake");
     _client_set_status(worker, client, Handshake);
     int accept_status = SSL_accept(client->ssl);
@@ -511,18 +557,17 @@ static Client *_accept_client(ServerWorker *worker){
         int reason = SSL_get_error(client->ssl, accept_status);
         if(reason != SSL_ERROR_WANT_READ && reason != SSL_ERROR_WANT_WRITE){
             SSL_ERROR("Failed when accepting ssl client");
-            goto exit_ssl;
+            goto exit_client_buffer;
         }
     }else{
+        client->has_been_connected = true;
+        if(worker->connectCallback.invoke){
+            worker->connectCallback.invoke(worker->connectCallback.u_data, client->handle);
+        }
         _client_set_status(worker, client, Idle);
     }
 
     LOG_DEBUG("Tried performing SSL handshake, but failed");
-
-    if(!_client_buffer_add(&worker->client_buffer, client)){
-        ERROR("Unable to store client in buffer. Disconnecting client");
-        goto exit_ssl;
-    }
 
     char buff[128];
     _ip_str((struct sockaddr *)&client->address, buff, sizeof(buff));
@@ -530,6 +575,8 @@ static Client *_accept_client(ServerWorker *worker){
 
     return client;
 
+exit_client_buffer:
+    _client_buffer_remove(&worker->client_buffer, client);
 exit_ssl:
     SSL_free(client->ssl);
     client->ssl = NULL;
@@ -622,6 +669,10 @@ static void _handle_client_handshake(ServerWorker *worker, Client *client){
         _ip_str((struct sockaddr *)&client->address, ipbuff, sizeof(ipbuff));
         LOG_INFO("Handshake done for %s", ipbuff);
         _client_set_status(worker, client, Idle);
+        client->has_been_connected = true;
+        if(worker->connectCallback.invoke != NULL){
+            worker->connectCallback.invoke(worker->connectCallback.u_data, client->handle);
+        }
         return;
     }
 
@@ -673,7 +724,7 @@ static void _handle_client_read(ServerWorker *worker, Client *client){
         else if(read_status == 1){
             LOG_DEBUG("%zu bytes of data received", n);
             if(worker->receivedCallback.invoke != NULL){
-                worker->receivedCallback.invoke(worker->receivedCallback.u_data, client->handle, buff, n);
+                worker->receivedCallback.invoke(worker->receivedCallback.u_data, client->u_client_data, client->handle, buff, n);
             }
         }
         else{
@@ -704,6 +755,10 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     assert(client != NULL);
     assert(client->socket > 0);
     assert(client->handle.index < worker->client_buffer.client_buffer_size);
+
+    if(client->has_been_connected && worker->disconnectCallback.invoke){
+        worker->disconnectCallback.invoke(worker->disconnectCallback.u_data, client->u_client_data, client->handle);
+    }
 
     ClientEntry *entry = &worker->client_buffer.clients[client->handle.index];
     assert(entry->generation == client->handle.generation);

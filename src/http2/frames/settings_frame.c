@@ -4,6 +4,26 @@
 #include "http2/http2_logging.h"
 #include <string.h>
 
+InternalSettingsFrame http2_frame_create_empty_settings_frame(){
+    return (InternalSettingsFrame){
+        .header = (InternalFrameHeader){
+            .flags = 0,
+            .stream_id = 0,
+            .type = Settings
+        },
+    };
+}
+
+InternalSettingsFrame http2_frame_create_ack_settings_frame(){
+    return (InternalSettingsFrame){
+        .header = (InternalFrameHeader){
+            .flags = ACK,
+            .stream_id = 0,
+            .type = Settings
+        },
+    };
+}
+
 ParseStatus http2_frame_parse_settings_frame(ParseBuffer *buffer, InternalSettingsFrame *result){
     InternalFrameHeader header;
     Payload payload_info;

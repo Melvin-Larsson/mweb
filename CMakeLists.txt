@@ -15,6 +15,7 @@ set(SOURCES
     src/http2/huffman.c
     src/http2/bit_stream.c
 
+    src/http2/http2_frame.c
     src/http2/frames/continuation_frame.c
     src/http2/frames/data_frame.c
     src/http2/frames/frame_utils.c
@@ -26,6 +27,8 @@ set(SOURCES
     src/http2/frames/rst_stream_frame.c
     src/http2/frames/settings_frame.c
     src/http2/frames/window_update_frame.c
+
+    src/http_core/http_core.c
 )
 
 set(LIB_NAME weblib)

@@ -6,13 +6,6 @@
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
 
-FrameType http2_frame_get_frame_type(char *buff, size_t len){
-    if(len < 4){
-        return Invalid;
-    }
-    return (FrameType)buff[3];
-}
-
 ParseStatus http2_frame_parse_priority_data(char *buff, size_t len, InternalPriorityData *result){
     if(len < PRIORITY_DATA_LENGTH){
         return ParseStatusMessageTooSmall;
@@ -89,28 +82,28 @@ size_t http2_frame_serialize_padded_frame(char *buff, size_t size, uint32_t payl
 }
 
 ParseStatus http2_frame_parse_frame_header(ParseBuffer *buffer, InternalFrameHeader *result, Payload *payload_info){
-    if(buffer->data_length < sizeof(ExternalFrameHeader)){
-        ERROR("Buffer length of size %zu bytes too small", buffer->data_length);
+    if(buffer->total_size - buffer->parsed_size < sizeof(ExternalFrameHeader)){
+        ERROR("Buffer length of size %zu bytes too small", buffer->total_size - buffer->parsed_size);
         return ParseStatusMessageTooSmall;
     }
 
-    ExternalFrameHeader *externalFrameHeader = (ExternalFrameHeader *)buffer->data;
+    ExternalFrameHeader *externalFrameHeader = (ExternalFrameHeader *)&buffer->data[buffer->parsed_size];
     *result = (InternalFrameHeader){
         .flags = externalFrameHeader->flags,
         .type = externalFrameHeader->type,
         .stream_id = __builtin_bswap32(externalFrameHeader->stream_id),
     };
     *payload_info = (Payload){
-        .size= _reverse_byte_order_24(externalFrameHeader->length),
-        .data = &buffer->data[9]
+        .size = _reverse_byte_order_24(externalFrameHeader->length),
+        .data = (uint8_t *)&buffer->data[buffer->parsed_size + 9]
     };
 
-    if(payload_info->size + sizeof(ExternalFrameHeader) > buffer->data_length){
-        ERROR("Message should be of size %zu, but was of size %zu", payload_info->size, buffer->data_length - sizeof(ExternalFrameHeader));
+    if(payload_info->size + sizeof(ExternalFrameHeader) > buffer->total_size - buffer->parsed_size){
+        ERROR("Message should be of size %zu, but was of size %zu", payload_info->size, buffer->total_size - sizeof(ExternalFrameHeader) - buffer->parsed_size);
         return ParseStatusMessageTooSmall;
     }
 
-    buffer->parsed_length = payload_info->size + 9;
+    buffer->parsed_size += payload_info->size + 9;
 
     return ParseStatusSuccess;
 }

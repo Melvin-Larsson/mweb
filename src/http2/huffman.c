@@ -129,9 +129,9 @@ static bool _initialize_huffman_tree(uint8_t prefix, HuffmanNodeBuffer *buffer, 
     return true;
 }
 
-size_t huffman_encode(char *data, size_t data_size, char *result, size_t max_result_size){
+size_t huffman_encode(uint8_t *data, size_t data_size, uint8_t *result, size_t max_result_size){
     BitStream bs;
-    bit_stream_init_empty((uint8_t *)result, max_result_size, &bs);
+    bit_stream_init_empty(result, max_result_size, &bs);
     size_t tot = 0;
     for(size_t i = 0; i < data_size; i++){
         HuffmanCode code = huffman_table[(uint8_t)data[i]];
@@ -173,7 +173,7 @@ HuffmanCode _decode(uint32_t code){
     return _decode_from_node(entry.node, code);
 }
 
-bool huffman_decode(char *data, size_t data_bit_count, char *result, size_t max_result_size, size_t *actual_result_size){
+bool huffman_decode(uint8_t *data, size_t data_bit_count, uint8_t *result, size_t max_result_size, size_t *actual_result_size){
     if(!initialized){
         initialized = _initialize();
         if(!initialized){
