@@ -1,4 +1,4 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include <assert.h>
 
@@ -10,10 +10,6 @@ ParseStatus http2_frame_parse_priority_frame(ParseBuffer *buffer, InternalPriori
         return status;
     }
     assert(header.type == Priority);
-
-    if(header.flags != 0){
-        return ParseStatusInvalidFlags;
-    }
 
     if(header.stream_id == 0){
         return ParseStatusMessageNotAllowdOnStream;

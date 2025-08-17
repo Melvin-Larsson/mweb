@@ -1,5 +1,5 @@
 #include "hpack_primitives.h"
-#include "http2/huffman.h"
+#include "huffman.h"
 #include "http2_logging.h"
 #include <assert.h>
 #include <stdlib.h>

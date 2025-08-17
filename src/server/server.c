@@ -1,4 +1,4 @@
-#include "server.h"
+#include "server/server.h"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,42 +9,61 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <sys/epoll.h>
-#include "cJSON.h"
 #include "http_core/http_core.h"
 #include "openssl/ssl.h"
-#include "openssl/err.h"
 #include "assert.h"
 #include "server_worker.h"
-#include "stringbuilder.h"
-#include "dirent.h"
 #include "config_manager.h"
 #include "http2/http2.h"
-// #include "fcntl.h"
-
-// typedef struct{
-//     SSL *ssl;
-//     int socketfd;
-// }Client;
-//
-
 
 ServerWorker *sworker;
-void signal_handler(int signal){
-//     assert(sworker);
-//     server_worker_request_stop(sworker);
+typedef enum{
+    Http2
+
+}ClientType;
+
+typedef struct{
+    ClientType type;
+    ClientHandle client;
+    union{
+        Http2Client *http2Client;
+    };
+}Client;
+
+void signal_handler(int signal){}
+
+bool send_cb(void *u_data, const uint8_t *data, size_t size){
+    Client *client_data = (Client *)u_data;
+    printf("Send cb %zu\n", client_data->client.index);
+    server_worker_send(sworker, client_data->client, (char *)data, size);
+
+    return true;
 }
 
-Http2Ctx *ctx;
 void on_disconnect(void *u_data, void *u_client_data, const ClientHandle client){
-   http2_handle_disconnect(ctx, u_client_data, client);
+    Client *client_data = (Client *)u_client_data;
+    http2_client_free(client_data->http2Client);
+    free(client_data);
 }
 
 void on_connect(void *u_data, const ClientHandle client){
-   http2_handle_connect(ctx, client);
+    Client *client_data = malloc(sizeof(Client));
+    assert(client_data != NULL);
+    Http2Client *http2Client = http2_client_new((Http2SendCb){.send = send_cb, .u_data = client_data});
+    assert(http2Client != NULL);
+
+    *client_data = (Client){
+        .type = Http2,
+        .client = client,
+        .http2Client = http2Client
+    };
+
+    server_worker_attach_client_data(sworker, client, client_data);
 }
 
-void on_data(void *u, void *client_data, const ClientHandle client, char *buff, size_t len){
-   http2_handle_message(ctx, client_data, client, buff, len);
+void on_data(void *u, void *u_client_data, const ClientHandle client, char *buff, size_t len){
+    Client *client_data = (Client *)u_client_data;
+    http2_client_handle_message(client_data->http2Client, buff, len);
 }
 
 void error_handler(int signal){
@@ -126,11 +145,6 @@ int server_run(){
     server_worker_set_connect_callback(sworker, on_connect, NULL);
     server_worker_set_disconnect_callback(sworker, on_disconnect, NULL);
     server_worker_set_ssl_ctx_cb(sworker, configure_ssl, NULL);
-
-   ctx = http2_new_ctx(sworker);
-   if(ctx == NULL){
-       return 1;
-   }
 
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);

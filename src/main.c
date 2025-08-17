@@ -1,5 +1,4 @@
-#include "server.h"
-#include "config_manager.h"
+#include "server/server.h"
 
 int main(){
     return server_run();

@@ -1,4 +1,4 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include <assert.h>
 
@@ -11,16 +11,12 @@ ParseStatus http2_frame_parse_rst_stream_frame(ParseBuffer *buffer, InternalRstS
     }
     assert(header.type == RstStream);
 
-    if(header.flags != 0){
-        return ParseStatusInvalidFlags;
-    }
-
     if(header.stream_id != 0){
         return ParseStatusMessageNotAllowdOnStream;
     }
 
     if(payload_info.size != 4){
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
 
     result->header = header;

@@ -1,5 +1,5 @@
 #include "test_harness.h"
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include <string.h>
 
 static void _print_parse_buffer(ParseBuffer buffer){

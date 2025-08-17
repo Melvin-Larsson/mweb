@@ -14,15 +14,15 @@
 
 typedef enum{
     ParseStatusSuccess = 0,
-    ParseStatusMessageTooSmall,
-    ParseSatusInvalidMessageSize,
+    ParseStatusNotFullMessage,
+    ParseStatusInvalidMessageSize,
     ParseStatusMissingPadding,
     ParseStatusMessageNotAllowdOnStream,
-    ParseStatusInvalidFlags,
     ParseStatusSettingsAckWithBody,
     ParseStatusInvalidSettingsFormat,
     ParseStatusInvalidSetting,
     ParseStatusInvalidSizeIncrement,
+    ParseStatusInvalidFrameType
 }ParseStatus;
 
 typedef enum{
@@ -151,8 +151,28 @@ typedef struct{
     size_t header_block_fragment_size;
 }InternalContinuationFrame;
 
+typedef struct{
+    FrameType type;
+    union{
+        InternalDataFrame data_frame;
+        InternalHeaderFrame header_frame;
+        InternalPriorityFrame priority_frame;
+        InternalRstStreamFrame rst_frame;
+        InternalSettingsFrame settings_frame;
+        InternalPushPromiseFrame push_promise_frame;
+        InternalPingFrame ping_frame;
+        InternalGoAwayFrame goaway_frame;
+        InternalWindowUpdateFrame window_update_frame;
+        InternalContinuationFrame continuation_frame;
+    };
+}GenericFrame;
+
+ParseStatus http2_frame_parse(ParseBuffer *parse_buffer,  GenericFrame *result);
+InternalFrameHeader http2_frame_get_header(const GenericFrame *frame);
+
 bool http2_frame_try_get_stream_id(uint8_t *buff, size_t len, uint32_t *stream_id);
 bool http2_frame_try_get_length(uint8_t *buff, size_t buffer_size, size_t *length);
+FrameType http2_frame_get_frame_type(uint8_t *buff, size_t len);
 
 InternalDataFrame http2_frame_create_data_frame(uint8_t *data, size_t size, uint32_t stream_id);
 ParseStatus http2_frame_parse_data_frame(ParseBuffer *buffer, InternalDataFrame *result);
@@ -176,9 +196,11 @@ size_t http2_frame_serialize_settings_frame(char *buffer, size_t size, InternalS
 ParseStatus http2_frame_parse_push_promise_frame(ParseBuffer *buffer, InternalPushPromiseFrame *result);
 size_t http2_frame_serialize_push_promise_frame(char *buffer, size_t size, InternalPushPromiseFrame *frame);
 
+InternalPingFrame http2_frame_create_ping_frame(bool ack, uint64_t data);
 ParseStatus http2_frame_parse_ping_frame(ParseBuffer *buffer, InternalPingFrame *result);
 size_t http2_frame_serialize_ping_frame(char *buffer, size_t size, InternalPingFrame *frame);
 
+InternalGoAwayFrame http2_frame_create_goaway_frame(uint32_t last_stream_id, ErrorCode error_code);
 ParseStatus http2_frame_parse_goaway_frame(ParseBuffer *buffer, InternalGoAwayFrame *result);
 size_t http2_frame_serialize_goaway_frame(char *buffer, size_t size, InternalGoAwayFrame *frame);
 
@@ -189,7 +211,5 @@ ParseStatus http2_frame_parse_continuation_frame(ParseBuffer *buffer, InternalCo
 size_t http2_frame_serialize_continuation_frame(char *buffer, size_t size, InternalContinuationFrame *frame);
 
 void http2_frame_print_settings(InternalSettingsFrame *settings);
-
-FrameType http2_frame_get_frame_type(char *buff, size_t len);
 
 #endif

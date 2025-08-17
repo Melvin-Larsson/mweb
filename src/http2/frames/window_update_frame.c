@@ -1,4 +1,4 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include <assert.h>
 
@@ -11,12 +11,8 @@ ParseStatus http2_frame_parse_window_update_frame(ParseBuffer *buffer, InternalW
     }
     assert(frame.type == WindowUpdate);
 
-    if(frame.flags != 0){
-        return ParseStatusInvalidFlags;
-    }
-
     if(payload_info.size != 4){
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
 
     *result = (InternalWindowUpdateFrame){

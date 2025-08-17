@@ -1,7 +1,7 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
-#include "http2/http2_logging.h"
+#include "http2_logging.h"
 #include <string.h>
 
 InternalSettingsFrame http2_frame_create_empty_settings_frame(){

@@ -2,9 +2,9 @@
 #define HPACK_H
 
 #include <stddef.h>
-#include "http2/buffers.h"
-#include "http2/hpack_primitives.h"
-#include "http_core/http_message.h"
+#include "buffers.h"
+#include "hpack_primitives.h"
+#include "http_message.h"
 
 typedef struct HpackEncoder HpackEncoder;
 typedef struct HpackDecoder HpackDecoder;

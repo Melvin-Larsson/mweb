@@ -323,7 +323,7 @@ ServerWorkerStatus server_worker_run(ServerWorker *worker){
     return _listen(worker);
 }
 
-ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle handle, char *buffer, size_t buffer_size){
+ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle handle, const char *buffer, size_t buffer_size){
     assert(worker != NULL);
     assert(buffer != NULL);
     Client *client = _client_buffer_get_client(worker, handle);

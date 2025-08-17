@@ -1,5 +1,5 @@
 #include "test_harness.h"
-#include "http2/bit_stream.h"
+#include "bit_stream.h"
 #include <assert.h>
 #include <limits.h>
 #include <stdint.h>

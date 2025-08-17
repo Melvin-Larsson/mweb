@@ -1,7 +1,7 @@
 #ifndef FRAME_UTILS_H
 #define FRAME_UTILS_H
 
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 
 #define PRIORITY_DATA_LENGTH 5
 #define _reverse_byte_order_24(x) (((x & 0xFF) << 16) | (x & 0xFF00) | ((x & 0xFF0000) >> 16))

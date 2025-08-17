@@ -1,4 +1,4 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h" 
 #include "assert.h"
 
@@ -15,12 +15,8 @@ ParseStatus http2_frame_parse_push_promise_frame(ParseBuffer *buffer, InternalPu
         return ParseStatusMessageNotAllowdOnStream;
     }
 
-    if((header.flags & ~(END_HEADERS | PADDED)) != 0){
-        return ParseStatusInvalidFlags;
-    }
-
     if(payload_info.size <= 4){
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
 
     result->header = header;

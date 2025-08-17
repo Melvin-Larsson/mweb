@@ -1,4 +1,4 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
 #include <string.h>
@@ -28,13 +28,9 @@ ParseStatus http2_frame_parse_header_frame(ParseBuffer *buffer, InternalHeaderFr
         return ParseStatusMessageNotAllowdOnStream;
     }
 
-    if((header.flags & ~(END_STREAM | END_HEADERS | PADDED | PRIORITY))){
-        return ParseStatusInvalidFlags;
-    }
-    
     result->header = header;
 
-    char *header_block_ptr = payload_info.data;
+    uint8_t *header_block_ptr = payload_info.data;
     size_t header_block_size = payload_info.size;
     if(header.flags & PRIORITY){
         ParseStatus status = http2_frame_parse_priority_data(payload_info.data, payload_info.size, &result->priority);

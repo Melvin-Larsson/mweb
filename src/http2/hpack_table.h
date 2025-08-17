@@ -2,7 +2,7 @@
 #define HPACK_TABLE_H
 
 #include <stddef.h>
-#include "http_core/http_message.h"
+#include "http_message.h"
 
 static const HttpHeaderField static_table[] = {
     {":authority",                 "",                10, 0},

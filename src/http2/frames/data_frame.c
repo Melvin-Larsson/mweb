@@ -1,8 +1,8 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
 #include <string.h>
-#include "http2/http2_logging.h"
+#include "http2_logging.h"
 
 InternalDataFrame http2_frame_create_data_frame(uint8_t *data, size_t size, uint32_t stream_id){
     assert(stream_id != 0);
@@ -30,12 +30,9 @@ ParseStatus http2_frame_parse_data_frame(ParseBuffer *buffer, InternalDataFrame 
     if(header.stream_id == 0){
         return ParseStatusMessageNotAllowdOnStream;
     }
-    if((header.flags & ~( END_STREAM | PADDED ))){
-        return ParseStatusInvalidFlags;
-    }
 
     *result = (InternalDataFrame){
-        .data = payload_info.data,
+        .data = (char *)payload_info.data,
         .header = header,
         .size = payload_info.size
     };

@@ -1,4 +1,4 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
 
@@ -11,17 +11,13 @@ ParseStatus http2_frame_parse_continuation_frame(ParseBuffer *buffer, InternalCo
     }
     assert(frame.type == Continuation);
 
-    if(frame.flags & ~(END_HEADERS)){
-        return ParseStatusInvalidFlags;
-    }
-
     if(frame.stream_id == 0){
         return ParseStatusMessageNotAllowdOnStream;
     }
 
     *result = (InternalContinuationFrame){
         .header = frame,
-        .header_block_fragment = payload_info.data,
+        .header_block_fragment = (char *)payload_info.data,
         .header_block_fragment_size = payload_info.size
     };
 

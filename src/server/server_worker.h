@@ -41,7 +41,7 @@ void server_worker_set_disconnect_callback(ServerWorker *worker, void (*callback
 
 ServerWorkerStatus server_worker_attach_client_data(ServerWorker *worker, const ClientHandle client, void *u_client_data);
 
-ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle client, char *buffer, size_t buffer_size);
+ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle client, const char *buffer, size_t buffer_size);
 
 void server_worker_request_stop(ServerWorker *worker);
 

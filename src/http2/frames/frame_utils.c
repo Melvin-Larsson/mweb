@@ -1,14 +1,14 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
 #include <string.h>
-#include "http2/http2_logging.h"
+#include "http2_logging.h"
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
 
 ParseStatus http2_frame_parse_priority_data(char *buff, size_t len, InternalPriorityData *result){
     if(len < PRIORITY_DATA_LENGTH){
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
     result->exclusive = buff[0] & 0x80 ? true : false;
     result->stream_dependency = ((buff[0] & 0x7F) << 24) | (buff[1] << 16) | (buff[2] << 8) | buff[3];
@@ -43,10 +43,10 @@ ParseStatus http2_frame_parse_padded_frame(ParseBuffer *buffer, InternalFrameHea
     }
 
     size_t size = payload_info->size;
-    char *data = payload_info->data;
+    uint8_t *data = payload_info->data;
     if(result->flags & PADDED){
         if(size == 0){
-            return ParseStatusMessageTooSmall;
+            return ParseStatusInvalidMessageSize;
         }
         char padd_length = data[0];
         if(size - 1 <= padd_length){
@@ -84,7 +84,7 @@ size_t http2_frame_serialize_padded_frame(char *buff, size_t size, uint32_t payl
 ParseStatus http2_frame_parse_frame_header(ParseBuffer *buffer, InternalFrameHeader *result, Payload *payload_info){
     if(buffer->total_size - buffer->parsed_size < sizeof(ExternalFrameHeader)){
         ERROR("Buffer length of size %zu bytes too small", buffer->total_size - buffer->parsed_size);
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
 
     ExternalFrameHeader *externalFrameHeader = (ExternalFrameHeader *)&buffer->data[buffer->parsed_size];
@@ -100,7 +100,7 @@ ParseStatus http2_frame_parse_frame_header(ParseBuffer *buffer, InternalFrameHea
 
     if(payload_info->size + sizeof(ExternalFrameHeader) > buffer->total_size - buffer->parsed_size){
         ERROR("Message should be of size %zu, but was of size %zu", payload_info->size, buffer->total_size - sizeof(ExternalFrameHeader) - buffer->parsed_size);
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
 
     buffer->parsed_size += payload_info->size + 9;

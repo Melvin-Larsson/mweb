@@ -1,6 +1,18 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
+
+InternalGoAwayFrame http2_frame_create_goaway_frame(uint32_t last_stream_id, ErrorCode error_code){
+    return (InternalGoAwayFrame){
+        .header = (InternalFrameHeader){
+            .flags = 0,
+            .stream_id = 0,
+            .type = GoAway
+        },
+        .last_stream_id = last_stream_id,
+        .error_code = error_code
+    };
+}
 
 ParseStatus http2_frame_parse_goaway_frame(ParseBuffer *buffer, InternalGoAwayFrame *result){
     InternalFrameHeader frame;
@@ -11,16 +23,12 @@ ParseStatus http2_frame_parse_goaway_frame(ParseBuffer *buffer, InternalGoAwayFr
     }
     assert(frame.type == GoAway);
 
-    if(frame.flags != 0){
-        return ParseStatusInvalidFlags;
-    }
-
     if(frame.stream_id != 0){
         return ParseStatusMessageNotAllowdOnStream;
     }
 
     if(payload_info.size < 8){
-        return ParseStatusMessageTooSmall;
+        return ParseStatusNotFullMessage;
     }
 
     *result = (InternalGoAwayFrame){

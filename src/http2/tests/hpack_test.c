@@ -1,7 +1,7 @@
-#include "http2/hpack.h"
+#include "hpack.h"
 #include "test_harness.h"
-#include "http2/huffman.h"
-#include "http2/hpack_primitives.h"
+#include "huffman.h"
+#include "hpack_primitives.h"
 #include <assert.h>
 #include <limits.h>
 #include <stdlib.h>

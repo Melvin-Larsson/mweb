@@ -1,7 +1,18 @@
-#include "http2/http2_frame.h"
+#include "http2_frame.h"
 #include "frame_utils.h"
 #include <assert.h>
 #include <string.h>
+
+InternalPingFrame http2_frame_create_ping_frame(bool ack, uint64_t data){
+    return (InternalPingFrame){
+        .header = (InternalFrameHeader){
+            .flags = ack ? ACK : 0,
+            .stream_id = 0,
+            .type = Ping
+        },
+        .data = data,
+    };
+}
 
 ParseStatus http2_frame_parse_ping_frame(ParseBuffer *buffer, InternalPingFrame *result){
     InternalFrameHeader frame;
@@ -12,10 +23,6 @@ ParseStatus http2_frame_parse_ping_frame(ParseBuffer *buffer, InternalPingFrame 
     }
     assert(frame.type == Ping);
 
-    if(frame.flags & ~ACK){
-        return ParseStatusInvalidFlags;
-    }
-
     if(frame.stream_id != 0){
         return ParseStatusMessageNotAllowdOnStream;
     }
@@ -23,7 +30,7 @@ ParseStatus http2_frame_parse_ping_frame(ParseBuffer *buffer, InternalPingFrame 
     result->header = frame;
 
     if(payload_info.size != 8){
-        return ParseSatusInvalidMessageSize;
+        return ParseStatusInvalidMessageSize;
     }
 
     memcpy(&result->data, payload_info.data, 8);

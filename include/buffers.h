@@ -79,5 +79,4 @@ static size_t buffer_snprintf(Buffer *buffer, const char *fmt, ...){
     return used_size;
 }
 
-
 #endif
