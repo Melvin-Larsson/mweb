@@ -16,6 +16,16 @@
 #include "config_manager.h"
 #include "http2/http2.h"
 
+#define TEST_NR 0
+
+#if TEST_NR == 0
+#include "thread_pool_perf_test.c"
+#elif TEST_NR == 1
+#include "thread_pool_test.c"
+#else
+#include "queue_test.c"
+#endif
+
 ServerWorker *sworker;
 typedef enum{
     Http2
@@ -94,6 +104,14 @@ bool configure_ssl(void *data, SSL_CTX *ctx){
 }
 
 int server_run(){
+#if TEST_NR == 0
+    return perf_test();
+#elif TEST_NR == 1
+    return chaotic_test();
+#elif TEST_NR == 2
+    return queue_test();
+#endif
+
     int status = 0;
     ConfigManager *manager = config_manager_load_from_appconfig();
     if(manager == NULL){

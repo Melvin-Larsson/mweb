@@ -44,9 +44,15 @@ set(HTTP_CORE_SOURCES
     src/http_core/stringbuilder.c
 )
 
+set(THREADPOOL_SOURCES
+    src/threadpool/threadpool.c
+    src/threadpool/queue.c
+)
+
 add_library(libserver ${SERVER_SOURCES})
 add_library(libhttp2 ${HTTP2_SOURCES})
 add_library(libhttpcore ${HTTP_CORE_SOURCES})
+add_library(libthreadpool ${THREADPOOL_SOURCES})
 
 configure_file(cert/cert.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
 configure_file(cert/key.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
@@ -63,6 +69,7 @@ target_link_libraries(libserver PRIVATE ${CJSON_LIBRARIES})
 target_include_directories(libserver PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libserver PRIVATE ${PROJECT_SOURCE_DIR}/src/server ${PROJECT_SOURCE_DIR}/src/common)
 target_link_libraries(libserver PRIVATE libhttp2)
+target_link_libraries(libserver PRIVATE libthreadpool)
 
 target_include_directories(libhttp2 PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libhttp2 PRIVATE ${PROJECT_SOURCE_DIR}/src/http2 ${PROJECT_SOURCE_DIR}/src/common)
@@ -73,6 +80,8 @@ target_link_libraries(libhttpcore PRIVATE ${CJSON_LIBRARIES})
 target_include_directories(libhttpcore PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libhttpcore PRIVATE ${PROJECT_SOURCE_DIR}/src/http_core ${PROJECT_SOURCE_DIR}/src/common)
 
+target_include_directories(libthreadpool PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(libthreadpool PRIVATE ${PROJECT_SOURCE_DIR}/src/threadpool)
 
 set(TARGET_NAME web)
 add_executable(${TARGET_NAME} src/main.c)
