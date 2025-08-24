@@ -15,10 +15,10 @@ typedef struct {
     int work_num;
 } WorkData;
 
-atomic_int work_done = 0;
+static atomic_int work_done = 0;
 
 // Simulated CPU-bound work: calculate nth Fibonacci number iteratively
-uint64_t fib(int n) {
+static uint64_t fib(int n) {
     if (n <= 1) return n;
     uint64_t a = 0, b = 1, c;
     for (int i = 2; i <= n; i++) {
@@ -30,7 +30,7 @@ uint64_t fib(int n) {
 }
 
 // Work callback for thread pool
-void work_task(void *u_data) {
+static void work_task(void *u_data) {
     WorkData *data = (WorkData *)u_data;
 
     // CPU-heavy calculation
@@ -45,7 +45,7 @@ void work_task(void *u_data) {
 #define FIB_NUM 10000
 
 // Sequential single-threaded execution
-void run_sequential() {
+static void run_sequential() {
     for (int i = 0; i < TOTAL_WORK_ITEMS; i++) {
         WorkData *data = malloc(sizeof(WorkData));
         data->work_num = FIB_NUM;
@@ -60,7 +60,7 @@ typedef struct {
     int end_index;
 } ThreadArg;
 
-void *worker_thread(void *arg) {
+static void *worker_thread(void *arg) {
     ThreadArg *targ = (ThreadArg *)arg;
 
     for (int i = targ->start_index; i < targ->end_index; i++) {
@@ -76,7 +76,7 @@ void *worker_thread(void *arg) {
 // Thread pool execution
 #define NUM_QUEUES 8  // Number of queues to spread work over
 #define NUM_THREADS NUM_QUEUES
-void run_raw_threads() {
+static void run_raw_threads() {
     pthread_t threads[NUM_THREADS];
     ThreadArg args[NUM_THREADS];
 
@@ -100,7 +100,7 @@ void run_raw_threads() {
 }
 
 
-void run_threadpool(ThreadPool *pool) {
+static void run_threadpool(ThreadPool *pool) {
     ThreadPoolQueue queues[NUM_QUEUES];
 
     // Create multiple queues
@@ -133,11 +133,11 @@ void run_threadpool(ThreadPool *pool) {
 }
 
 // Timing helper
-double timediff_sec(struct timespec start, struct timespec end) {
+static double timediff_sec(struct timespec start, struct timespec end) {
     return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 }
 
-int perf_test() {
+static int perf_test() {
     srand(time(NULL));
 
     printf("Running sequential test...\n");

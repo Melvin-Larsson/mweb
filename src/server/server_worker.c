@@ -747,6 +747,8 @@ static void _disconnect_all_clients(ServerWorker *worker){
         }
         _disconnect_and_free_client(worker, client);
     }   
+
+    LOG_INFO("All clients disconnected");
 }
 
 static void _disconnect_and_free_client(ServerWorker *worker, Client *client){

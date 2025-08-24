@@ -1,6 +1,7 @@
 #include "http2_common.h"
 #include "http_core/http_core.h"
 #include "http2_logging.h"
+#include <stdlib.h>
 
 bool http2_common_send(Http2Client *client, uint8_t *data, size_t size){
     return client->send_cb.send(client->send_cb.u_data, data, size);
@@ -14,7 +15,68 @@ void http2_common_send_goaway(Http2Client *client, ErrorCode error_code){
     //TODO close connection
 }
 
-void http2_common_handle_headers(Http2Client *client, Stream *stream, InternalHeaderFrame frame){
+typedef struct{
+    Http2Client *client;
+    Stream *stream;
+    CancellationToken *token;
+    CancellationTokenCallbackHandle handle;
+}ResponseCtx;
+
+static void _on_response_created(void *u_data, HttpResponse *response){
+    ResponseCtx *ctx = (ResponseCtx *)u_data;
+    Http2Client *client = ctx->client;
+    Stream *stream = ctx->stream;
+
+    cancellation_token_remove_callback(ctx->token, ctx->handle);
+
+    printf("Created response:\n%.*s\n", (int)response->body_size, (char *)response->body);
+    printf("With header fields\n");
+    http_header_fields_print(response->headers, response->header_count);
+
+    uint8_t buffer_data[4096];
+    Buffer buffer;
+    buffers_init_buffer(&buffer, buffer_data, sizeof(buffer_data));
+
+    uint8_t *response_headers = buffer_get_append_ptr(&buffer);
+    HttpHeaderField status_header_field = http_status_header_field(response->status);
+    size_t header_size = hpack_encode_headers(client->encoder, &status_header_field, 1, &buffer, IndexTypeIncremental);
+    header_size += hpack_encode_headers(client->encoder, response->headers, response->header_count, &buffer, IndexTypeIncremental);
+    assert(!buffer_size_is_full(&buffer));
+
+    InternalHeaderFrame header_frame = http2_frame_create_header_frame(response_headers, header_size, stream->id, true);
+    InternalDataFrame data_frame = http2_frame_create_data_frame(response->body, response->body_size, stream->id);
+    data_frame.header.flags |= END_STREAM;
+    if(response->body_size == 0){
+        header_frame.header.flags |= END_STREAM;
+    }
+
+    uint8_t *frame_ptr = buffer_get_append_ptr(&buffer);
+    size_t total_size = 0;
+    size_t size_left = buffer_size_left(&buffer);
+    size_t headers_size = http2_frame_serialize_header_frame((char *)frame_ptr, size_left, &header_frame);
+    size_left -= headers_size;
+    total_size += headers_size;
+    if(response->body_size > 0){
+        size_t data_size = http2_frame_serialize_data_frame((char *)frame_ptr + headers_size, size_left, &data_frame);
+        size_left -= data_size;
+        total_size += data_size;
+    }
+
+    assert(size_left != 0);
+
+    LOG_DEBUG("Sending %zu bytes to client", total_size);
+    http2_common_send(client, frame_ptr, total_size);
+
+    stream->state = Closed;
+
+    free(ctx);
+}
+
+static void _free_response_ctx(void *ctx){
+    free(ctx);
+}
+
+Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, InternalHeaderFrame frame, CancellationToken *token){
     uint8_t data[4096];
     Buffer buffer;
     ParseBuffer header_parse_buffer;
@@ -92,12 +154,12 @@ void http2_common_handle_headers(Http2Client *client, Stream *stream, InternalHe
 
     if(!has_method){
         ERROR("Request is missing method");
-        return;
+        return completed_task();
     }
 
     if(!has_path){
         ERROR("Request is missing path");
-        return;
+        return completed_task();
     }
 
     HttpRequest request = {
@@ -115,42 +177,24 @@ void http2_common_handle_headers(Http2Client *client, Stream *stream, InternalHe
     Buffer response_buffer;
     buffers_init_buffer(&response_buffer, response_data, sizeof(response_data));
     HttpResponse http_response;
-    http_core_create_response(&request, &http_response, &response_buffer);
 
-    printf("Created response:\n%.*s\n", (int)http_response.body_size, (char *)http_response.body);
-    printf("With header fields\n");
-    http_header_fields_print(http_response.headers, http_response.header_count);
+    ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
+    *ctx = (ResponseCtx){
+        .client = client,
+        .stream = stream,
+        .token = token,
+    };
+    ResponseCallback callback = {
+        .invoke = _on_response_created,
+        .u_data = ctx,
+    };
 
-    uint8_t *response_headers = buffer_get_append_ptr(&buffer);
-    HttpHeaderField status_header_field = http_status_header_field(http_response.status);
-    size_t header_size = hpack_encode_headers(client->encoder, &status_header_field, 1, &buffer, IndexTypeIncremental);
-    header_size += hpack_encode_headers(client->encoder, http_response.headers, http_response.header_count, &buffer, IndexTypeIncremental);
-    assert(!buffer_size_is_full(&buffer));
-
-    InternalHeaderFrame header_frame = http2_frame_create_header_frame(response_headers, header_size, frame.header.stream_id, true);
-    InternalDataFrame data_frame = http2_frame_create_data_frame(http_response.body, http_response.body_size, frame.header.stream_id);
-    data_frame.header.flags |= END_STREAM;
-    if(http_response.body_size == 0){
-        header_frame.header.flags |= END_STREAM;
-    }
-
-    uint8_t *frame_ptr = buffer_get_append_ptr(&buffer);
-    size_t total_size = 0;
-    size_t size_left = buffer_size_left(&buffer);
-    size_t headers_size = http2_frame_serialize_header_frame((char *)frame_ptr, size_left, &header_frame);
-    size_left -= headers_size;
-    total_size += headers_size;
-    if(http_response.body_size > 0){
-        size_t data_size = http2_frame_serialize_data_frame((char *)frame_ptr + headers_size, size_left, &data_frame);
-        size_left -= data_size;
-        total_size += data_size;
-    }
-
-    assert(size_left != 0);
-
-    LOG_DEBUG("Sending %zu bytes to client", total_size);
-    http2_common_send(client, frame_ptr, total_size);
-
-    stream->state = Closed;
+    LOG_INFO("Asking for resposne %X", ctx);
+    CancellationTokenCallback cb = {
+        .on_cancel = _free_response_ctx,
+        .u_data = ctx
+    };
+    cancellation_token_add_callback(token, cb, &ctx->handle);
+    return http_core_create_response_async(&request, callback, token);
 }
 

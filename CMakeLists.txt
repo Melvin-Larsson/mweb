@@ -44,15 +44,32 @@ set(HTTP_CORE_SOURCES
     src/http_core/stringbuilder.c
 )
 
+set(IO_URING_SOURCES
+    src/io_uring/io_uring.c
+)
+
+set(TASK_SOURCES
+    src/task/task.c
+)
+
+set(COLLECTIONS_SOURCES
+    src/collections/slot_map.c
+    src/collections/arraylist.c
+)
+
 set(THREADPOOL_SOURCES
     src/threadpool/threadpool.c
     src/threadpool/queue.c
+    src/threadpool/cancellation_token.c
 )
 
 add_library(libserver ${SERVER_SOURCES})
 add_library(libhttp2 ${HTTP2_SOURCES})
 add_library(libhttpcore ${HTTP_CORE_SOURCES})
 add_library(libthreadpool ${THREADPOOL_SOURCES})
+add_library(libiouring ${IO_URING_SOURCES})
+add_library(libcollections ${COLLECTIONS_SOURCES})
+add_library(libtask ${TASK_SOURCES})
 
 configure_file(cert/cert.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
 configure_file(cert/key.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
@@ -70,18 +87,33 @@ target_include_directories(libserver PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libserver PRIVATE ${PROJECT_SOURCE_DIR}/src/server ${PROJECT_SOURCE_DIR}/src/common)
 target_link_libraries(libserver PRIVATE libhttp2)
 target_link_libraries(libserver PRIVATE libthreadpool)
+target_link_libraries(libserver PRIVATE libiouring)
+target_link_libraries(libserver PRIVATE libtask)
 
 target_include_directories(libhttp2 PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libhttp2 PRIVATE ${PROJECT_SOURCE_DIR}/src/http2 ${PROJECT_SOURCE_DIR}/src/common)
 target_link_libraries(libhttp2 PRIVATE libhttpcore)
+target_link_libraries(libhttp2 PRIVATE libtask)
 
 target_include_directories(libhttpcore PRIVATE ${CJSON_INCLUDE_DIRS})
 target_link_libraries(libhttpcore PRIVATE ${CJSON_LIBRARIES})
+target_link_libraries(libhttpcore PRIVATE libiouring)
 target_include_directories(libhttpcore PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libhttpcore PRIVATE ${PROJECT_SOURCE_DIR}/src/http_core ${PROJECT_SOURCE_DIR}/src/common)
 
 target_include_directories(libthreadpool PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libthreadpool PRIVATE ${PROJECT_SOURCE_DIR}/src/threadpool)
+target_link_libraries(libthreadpool PRIVATE libcollections)
+
+target_include_directories(libiouring PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(libiouring PRIVATE ${PROJECT_SOURCE_DIR}/src/io_uring)
+target_link_libraries(libiouring PRIVATE libcollections)
+
+target_include_directories(libcollections PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(libcollections PRIVATE ${PROJECT_SOURCE_DIR}/src/collections)
+
+target_include_directories(libtask PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(libtask PRIVATE ${PROJECT_SOURCE_DIR}/src/task)
 
 set(TARGET_NAME web)
 add_executable(${TARGET_NAME} src/main.c)

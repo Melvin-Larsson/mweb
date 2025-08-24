@@ -9,22 +9,24 @@ static void _handle_settings(Http2Client *client, InternalSettingsFrame frame);
 static void _handle_window_update(Http2Client *client, InternalWindowUpdateFrame frame);
 static void _handle_ping(Http2Client *client, InternalPingFrame frame);
 
-void default_stream_handle_message(Http2Client *client, const GenericFrame *frame){
+Task default_stream_handle_message_async(Http2Client *client, const GenericFrame *frame, CancellationToken *token){
     switch(frame->type){
         case Settings:
             _handle_settings(client, frame->settings_frame);
             break;
         case WindowUpdate:
             client->window_size += frame->window_update_frame.size_increment;
-            return;
+            break;
         case GoAway:
             LOG_DEBUG("Go away received, reason %d", frame->goaway_frame.error_code);
-            return;
+            break;
         default:
             ERROR("Unable to handle frame of type %d on default stream", frame->type);
             http2_common_send_goaway(client, ErrorCodeProtocolError);
             break;
     }
+
+    return completed_task();
 }
 
 void _handle_settings(Http2Client *client, InternalSettingsFrame frame){

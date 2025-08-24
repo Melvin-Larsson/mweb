@@ -9,15 +9,16 @@ static void _open_stream_handle_data(Http2Client *client, Stream *stream, Intern
 static void _open_stream_handle_window_update(Http2Client *client, Stream *stream, InternalWindowUpdateFrame frame);
 static void _open_stream_handle_continuation(Http2Client *client, Stream *stream, InternalContinuationFrame frame);
 
-void open_stream_handle_message(Http2Client *client, Stream *stream, const GenericFrame *frame){
+Task open_stream_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token){
     InternalFrameHeader header = http2_frame_get_header(frame);
 
+    Task task = completed_task();
     switch(frame->type){
         case Data:
             _open_stream_handle_data(client, stream, frame->data_frame);
             break;
         case Headers:
-            http2_common_handle_headers(client, stream, frame->header_frame);
+            task = http2_common_handle_headers_async(client, stream, frame->header_frame, token);
             break;
         case WindowUpdate:
             stream->window_size += frame->window_update_frame.size_increment;
@@ -35,8 +36,9 @@ void open_stream_handle_message(Http2Client *client, Stream *stream, const Gener
 
     if(header.flags & END_STREAM && stream->state == Open){
         stream->state = HalfClosedRemote;
-        return;
     }
+
+    return task;
 }
 
 static void _open_stream_handle_data(Http2Client *client, Stream *stream, InternalDataFrame frame){

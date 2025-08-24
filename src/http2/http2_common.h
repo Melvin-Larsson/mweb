@@ -34,7 +34,7 @@ struct Http2Client{
     Http2SendCb send_cb;
 };
 
-void http2_common_handle_headers(Http2Client *client, Stream *stream, InternalHeaderFrame frame);
+Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, InternalHeaderFrame frame, CancellationToken *token);
 bool http2_common_send(Http2Client *client, uint8_t *data, size_t size);
 void http2_common_send_goaway(Http2Client *client, ErrorCode error_code);
 

@@ -3,17 +3,19 @@
 #include <assert.h>
 
 
-void half_closed_remote_handle_message(Http2Client *client, Stream *stream, const GenericFrame *frame){
+Task half_closed_remove_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token){
     assert(stream->state == HalfClosedRemote);
 
     switch(frame->type){
         case WindowUpdate:
             stream->window_size += frame->window_update_frame.size_increment;
-            return;
+            break;
         case Priority:
             LOG_DEBUG("Priority is not implementeed for half closed (remote) stream. Ignoring.");
-            return;
+            break;
         default:
-            return;
+            break;
     }
+
+    return completed_task();
 }

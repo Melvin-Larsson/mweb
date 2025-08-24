@@ -2,6 +2,7 @@
 #define THREADPOOL_H
 
 #include <stdbool.h>
+
 typedef struct ThreadPool ThreadPool;
 
 typedef struct{

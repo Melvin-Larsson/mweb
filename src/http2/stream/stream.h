@@ -22,9 +22,9 @@ typedef struct{
     size_t window_size;
 }Stream;
 
-void idle_stream_handle_message(Http2Client *client, Stream *stream, const GenericFrame *frame);
-void open_stream_handle_message(Http2Client *client, Stream *stream, const GenericFrame *frame);
-void half_closed_remote_handle_message(Http2Client *client, Stream *stream, const GenericFrame *frame);
-void default_stream_handle_message(Http2Client *client, const GenericFrame *frame);
+Task idle_stream_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token);
+Task open_stream_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token);
+Task half_closed_remove_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token);
+Task default_stream_handle_message_async(Http2Client *client, const GenericFrame *frame, CancellationToken *token);
 
 #endif

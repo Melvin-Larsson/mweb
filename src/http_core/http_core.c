@@ -1,329 +1,179 @@
 #include "http_core/http_core.h"
-#include "cJSON.h"
-#include "stringbuilder.h"
-#include <assert.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <dirent.h>
-#include <stdio.h>
+#include <fcntl.h>
 #include <stdlib.h>
-#include <time.h>
+#include "io_uring/io_uring.h"
+
+#define LOG_DEBUG_ENABLED
+#define LOG_INFO(format, ...) printf("[HttpCore INFO] " format "\n", ##__VA_ARGS__)
+#ifdef LOG_DEBUG_ENABLED
+#define LOG_DEBUG(format, ...) printf("[HttpCore Debug] " format "\n", ##__VA_ARGS__)
+#define ERROR(format, ...) fprintf(stderr,"[HttpCore Error] " format "\n", ##__VA_ARGS__)
+#define ERRNO_ERROR(format, ...) fprintf(stderr,"[HttpCore Error] " format "\n\t Reason: %s\n", strerror(errno), ##__VA_ARGS__)
+#else
+#define LOG_DEBUG(format, ...)
+#define ERROR(format, ...)
+#define ERRNO_ERROR(format, ...)
+#endif
+
+#define DEFAULT_INDEX_BUFFER_COUNT 32
+#define ENTRY_COUNT_SCALING_FACTOR 1.5
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
 
-typedef enum{
-    HTML,
-    CSS,
-    Unknown,
-}ContentType;
-
+typedef struct{
+    int index;
+    const char *full_path;
+}ContentHandle;
 
 typedef struct{
-    const char *name;
-    const char *route;
-    const char *page;
-}Page;
+    const char *path;
+    ContentHandle content;
+}IndexEntry;
 
 typedef struct{
-    Page *pages;
-    size_t page_buffer_size; 
-    size_t page_count; 
-}Content;
+    IndexEntry *entries;
+    size_t entry_buffer_size;
+    size_t entry_count;
+}Index;
 
 typedef struct{
-    const char *name;
-    char *(*handle)(void);
-}ContentFunction;
+    Index index;
+    size_t content_count;
+}HttpCore;
 
-static char *_create_ok_response(const char *content, ContentType type);
-static Page *_find_page(Content *content, const char *route, size_t route_length);
-static bool _route_equals_ignoring_html(const char *r1, size_t l1, const char *r2, size_t l2);
+static bool _load_content(HttpCore *core, const char *root, const char *path);
+static void _print_index(Index *index);
 
-static char *_populate_page(const char *content, Buffer *buffer, size_t *result_length);
-static bool _try_get_content_function(char *key, size_t key_length, ContentFunction *result);
-static char *_time_content();
-static char *_served_count_content();
-
-static bool _try_load_resources(Content **result);
-static bool _load_content_from_dir(char *root_path, Content *result);
-
-static bool _add_page_to_content_with_routes(Content *content, const char *page, const char *name);
-static bool _add_page_to_content(Content *content, const char *page, const char *name, const char *route);
-
+bool _init_handle(HttpCore *core, ContentHandle *handle, const char *absolute_path);
+void _clear_handle(ContentHandle *handle);
 
 static bool _is_valid_content(const char *file_name);
-static ContentType _get_content_type(const char *file_name);
-
-static char *_load_content_file(const char *name);
-static char *_read_file(const char *path);
-
 static bool _has_file_extension(const char *file_name, const char *extension);
-static char *_get_full_content_path(const char *relative_path);
-static char *_concat_path(const char *path1, const  char *path2);
+static size_t _concat_path(char *buffer, size_t buffer_size, const char *p1, const char *p2);
 
-static ContentFunction functions[] = {
-    {"TIME", _time_content },
-    {"SERVED_COUNT", _served_count_content }
-};
-const size_t content_function_count = sizeof(functions) / sizeof(ContentFunction);
+static bool _index_init(Index *index);
+static bool _index_append(Index *index, IndexEntry entry);
+static bool _index_try_get_content_handle(Index *index, const char *path, size_t path_length, ContentHandle *handle);
 
-static int served_count = 0;
-static char *_content_path;
-static cJSON *routes_json = NULL;
-static Content *content;
 
+static HttpCore core;
 
 bool http_core_init(const char *content_path){
-    _content_path = strdup(content_path);
-
-    if(!_try_load_resources(&content)){
-        goto exit_content_path;
-    }
-
-    char *routes_file_path = malloc(strlen(content_path) + strlen("/") + strlen("routes.json") + 1);
-    strcpy(routes_file_path, content_path);
-    strcat(routes_file_path, "/");
-    strcat(routes_file_path, "routes.json");
-    char *routes_content = _read_file(routes_file_path);
-    free(routes_file_path);
-    if(routes_content != NULL){
-        printf("Parsing routes.json\n");
-        routes_json = cJSON_Parse(routes_content);
-        free(routes_content);
-
-        if(routes_json == NULL){
-            printf("Unable to parse routes.json\n");
-        }
-        else{
-            printf("routes.json parsed\n");
-        }
-    }
-    else{
-        printf("Could not find routes.json\n");
-    }
-
-    return true;
-
-exit_content_path:
-    free(_content_path);
-    return false;
-}
-
-void http_core_create_response(const HttpRequest *request, HttpResponse *response, Buffer *buffer){
-    char response_400[] = "HTTP/1.1 400 Bad Request\r\n"
-        "Connection: close\r\n\r\n";
-    char *get = "GET ";
-
-    if(request->method != GET){
-        *response = http_response_empty(HttpStatus400);
-        return;
-    }
-
-    printf("Received request for page %.*s\n", (int)request->path_length, request->path);
-    served_count++;
-    Page *page = _find_page(content, request->path, request->path_length);
-    if(page == NULL){
-        printf("404 not found\n");
-        *response = http_response_empty(HttpStatus404);
-        return;
-    }
-
-    ContentType type = _get_content_type(page->name);
-    char *content_type;
-    if(type == HTML){
-       *response = http_response_empty(HttpStatus200);
-       response->body = (uint8_t *)_populate_page(page->page, buffer, &response->body_size);
-       content_type = "text/html; charset=UTF-8";
-
-    }
-    else if (type == CSS){
-        *response = http_response_empty(HttpStatus200);
-        response->body = (uint8_t *)page->page;
-        response->body_size = strlen((char *)response->body);
-        content_type = "text/css; charset=UTF-8";
-    }
-    else{
-        printf("404 not found (unknown content type)\n");
-        *response = http_response_empty(HttpStatus404);
-        return;
-    }
-
-    uint8_t *ptr = buffer_get_append_ptr(buffer);
-    buffer_snprintf(buffer, "%d", response->body_size);
-    HttpHeaderField headers[] = {
-         http_header_field_from_str("content-type", content_type),
-         http_header_field_from_str("content-length", (char *)ptr),
-    };
-    HttpHeaderField *buffered_fields = (HttpHeaderField *)buffer_get_append_ptr(buffer);
-    buffers_append(buffer, (uint8_t *)&headers, sizeof(headers));
- 
-    response->headers = buffered_fields;
-    response->header_count = 2;
-}
-
-static char *_create_ok_response(const char *content, ContentType type){
-    const char response_200_html[] = "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html; charset=UTF-8\r\n"
-        "Cross-Origin-Opener-Policy: same-origin-allow-popups\r\n"
-        "Referrer-Policy: no-referrer-when-downgrade\r\n"
-        "Content-Length: %zu\r\n"
-        "\r\n"
-        "%s";
-    
-    const char response_200_css[] = "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/css; charset=UTF-8\r\n"
-        "Cross-Origin-Opener-Policy: same-origin-allow-popups\r\n"
-        "Referrer-Policy: no-referrer-when-downgrade\r\n"
-        "Content-Length: %zu\r\n"
-        "\r\n"
-        "%s";
-
-    const char *response_template = type == CSS ? response_200_css : response_200_html;
-
-    size_t max_str_len = strlen(response_template) + strlen(content) + 20;
-    char *response = malloc(max_str_len + 1);
-    int res =  snprintf(response, max_str_len, response_template, strlen(content), content);
-
-    assert(res < max_str_len);
-
-    return response;
-}
-
-static Page *_find_page(Content *content, const char *route, size_t route_length){
-    if(strncmp(route, "/", route_length) == 0){
-        route = "/index.html";
-        route_length = strlen("/index.html");
-    }
-
-    for(size_t i = 0; i < content->page_count; i++){
-        if(_route_equals_ignoring_html(content->pages[i].route, strlen(content->pages[i].route), route, route_length)){
-            return &content->pages[i];
-        }
-    }
-
-    return NULL;
-}
-
-static bool _route_equals_ignoring_html(const char *r1, size_t l1, const char *r2, size_t l2){
-    printf("equals? %.*s == %.*s\n", (int)l1, r1, (int)l2, r2);
-    size_t i = 0;
-    for(; i < min(l1, l2); i++){
-        if(r1[i] != r2[i]){
-            break;
-        }
-    }
-
-    if(i == l1 && i == l2){
-        return true;
-    }
-
-    if(i == l1 && strncmp(&r2[i], ".html", l2 - i) == 0){
-        return true;
-    }
-
-    if(i == l2 && strncmp(&r1[i], ".html", l1 - 1) == 0){
-        return true;
-    }
-
-    return false;
-}
-
-static char *_populate_page(const char *content, Buffer *buffer, size_t *result_length){
-    StringBuilder *string_builder = string_builder_new(strlen(content));
-
-    const char *start = content;
-    while(*start != '\0'){
-        char *tag_start = strstr(start, "[");
-        if(tag_start == NULL){
-            string_builder_append(string_builder, start);
-            break;
-        }
-        char *tag_end = strstr(tag_start, "]");
-        if(tag_end == NULL){
-            string_builder_append(string_builder, start);
-            break;
-        }
-
-        string_builder_append_len(string_builder, start, tag_start - start);
-
-        if(*(tag_start + 1) == '['){
-            string_builder_append(string_builder, "[");
-            start = tag_start + 2;
-            continue;
-        }
-
-        ContentFunction function;
-        if(_try_get_content_function(tag_start + 1, tag_end - tag_start - 1, &function)){
-            printf("get content\n\n");
-            char *dynamic_content = function.handle();
-            string_builder_append(string_builder, dynamic_content);
-            free(dynamic_content);
-
-        }
-        start = tag_end + 1;
-    }
-
-    char *result_content = string_builder_to_string_and_free(string_builder);
-    char *result = (char *)buffer_get_append_ptr(buffer);
-   *result_length = buffers_append(buffer, (uint8_t *)result_content, strlen(result_content));
-    free(result_content);
-    return result;
-}
-
-
-static bool _try_get_content_function(char *key, size_t key_length, ContentFunction *result){
-    for(size_t i = 0; i < content_function_count; i++){
-        if(strncmp(key, functions[i].name, key_length) == 0){
-            *result =  functions[i];
-            return true;
-        }
-    }
-    return false;
-}
-
-
-static bool _try_load_resources(Content **result){
-    printf("Loading resources...\n");
-
-    *result = malloc(sizeof(Content));
-    **result = (Content){
-        .pages = malloc(sizeof(Page) * 16),
-        .page_buffer_size = 16,
-        .page_count = 0
-    };
-
-    return _load_content_from_dir("/", *result);
-}
-
-static char *_time_content(){
-    time_t now = time(NULL);
-    struct tm *local_time = localtime(&now);
-    char *time = asctime(local_time);
-    char *result = malloc(strlen(time) + 1);
-    strcpy(result, time);
-    result[strlen(result) - 1] = 0;
-    return result;
-}
-
-static char *_served_count_content(){
-    char *buff = malloc(8);
-    snprintf(buff, sizeof(buff), "%d", served_count);
-    return buff;
-}
-
-
-
-static bool _load_content_from_dir(char *root_path, Content *result){
-#ifdef _DEFAULT_SOURCE
-
-    printf("get full conetnt path for %s\n", root_path);
-    char *full_root_path = _get_full_content_path(root_path);
-    if(full_root_path == NULL){
+    if(!_index_init(&core.index)){
         return false;
     }
-    printf("Opening directory %s\n", full_root_path);
+    core.content_count = 0;
+
+    if(!_load_content(&core, content_path, "/")){
+        ERROR("Unable to load content index");
+        return false;
+    }
+
+    _print_index(&core.index);
+
+    return true;
+}
+
+typedef struct{
+    ResponseCallback callback;
+    HttpResponse result;
+    int fd;
+    CancellationToken *token;
+    CancellationTokenCallbackHandle handle;
+}ResponseCtx;
+
+static off_t _file_size(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        ERRNO_ERROR("Unable to read file size");
+        return -1;
+    }
+    return st.st_size;
+}
+
+void _on_file_read(void *arg){
+    ResponseCtx *ctx = (ResponseCtx *)arg;
+    cancellation_token_remove_callback(ctx->token, ctx->handle);
+    ctx->callback.invoke(ctx->callback.u_data, &ctx->result);
+    free(ctx->result.body);
+    free(ctx);
+}
+
+static void _free_response_ctx(void *arg){
+    ResponseCtx *ctx = (ResponseCtx *)arg;
+    free(ctx->result.body);
+    free(ctx);
+}
+
+Task http_core_create_response_async(const HttpRequest *request, ResponseCallback callback, CancellationToken *token){
+    if(callback.invoke == NULL){
+        assert(false && "No callback function specified");
+        return completed_task();
+    }
+
+    ContentHandle handle;
+    if(!_index_try_get_content_handle(&core.index, request->path, request->path_length, &handle)){
+        HttpResponse response = http_response_empty(HttpStatus404);
+        callback.invoke(callback.u_data, &response);
+        return completed_task();
+    }
+
+    int fd = open(handle.full_path, O_RDONLY);
+    if(fd <= 0){
+        ERROR("Indexed file not found");
+        HttpResponse response = http_response_empty(HttpStatus404);
+        callback.invoke(callback.u_data, &response);
+        return completed_task();
+    }
+
+    off_t file_size = _file_size(handle.full_path);
+    if(file_size < 0){
+        return completed_task();
+    }
+
+    ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
+    if(ctx == NULL){
+        ERROR("Unable to allocate response ctx");
+        return completed_task();
+    }
+    *ctx = (ResponseCtx){
+        .callback = callback,
+        .fd = fd,
+        .result = http_response_empty(HttpStatus200),
+        .token = token
+    };
+    ctx->result.body_size = file_size;
+    ctx->result.body = malloc(file_size);
+    if(ctx->result.body == NULL){
+        ERROR("Unable to allocate response body");
+        free(ctx);
+        return completed_task();
+    }
+
+    CancellationTokenCallback cb = {
+        .on_cancel = _free_response_ctx,
+        .u_data = ctx
+    };
+    cancellation_token_add_callback(token, cb, &ctx->handle);
+    IoUringOp op = io_uring_read_op(fd, ctx->result.body, file_size);
+    return io_uring_task(_on_file_read, ctx, op);
+}
+
+static bool _load_content(HttpCore *core, const char *root, const char *path){
+    char full_root_path[512];
+    size_t len = _concat_path(full_root_path, sizeof(full_root_path), root, path);
+    
+    if(len >= sizeof(full_root_path)){
+        assert(false && "Buffer too small");
+        return false;
+    }
 
     DIR *root_dir = opendir(full_root_path);
     if(root_dir == NULL){
-        fprintf(stderr, "Unable to read directory %s\n", full_root_path);
+        ERROR("Unable to read directory %s", full_root_path);
         return false;
     }
 
@@ -332,150 +182,69 @@ static bool _load_content_from_dir(char *root_path, Content *result){
         if(file->d_name[0] == '.'){
             continue;
         }
+        char relative_path[512];
+        char full_path[512];
+
+        size_t relative_path_size = _concat_path(relative_path, sizeof(relative_path), path, file->d_name);
+        size_t full_path_size = _concat_path(full_path, sizeof(full_path), full_root_path, file->d_name);
+
+        if(relative_path_size >= sizeof(relative_path) || full_path_size >= sizeof(full_path)){
+            assert(false && "Buffer too small");
+            goto exit_failure;
+        }
+
         if(file->d_type == DT_REG){
-            printf("Found file %s\n", file->d_name);
             if(!_is_valid_content(file->d_name)){
                 continue;
             }
-            char *relative_path = _concat_path(root_path, file->d_name);
-            printf("rel %s\n", relative_path);
-            if(relative_path == NULL){
-                break;
+            ContentHandle handle;
+            if(!_init_handle(core, &handle, full_path)){
+                goto exit_failure;
             }
-            char *full_file_path = _get_full_content_path(relative_path);
-            if(full_file_path == NULL){
-                free(relative_path);
-                break;
+            IndexEntry entry = {
+                .content = handle,
+                .path = strdup(relative_path)
+            };
+            if(entry.path == NULL || !_index_append(&core->index, entry)){
+                _clear_handle(&handle);
+                goto exit_failure;
             }
-            printf("Adding %s\n", full_file_path);
-            char *content = _read_file(full_file_path);
-            if(content == NULL){
-                free(relative_path);
-                free(full_file_path);
-                break;
-            }
-            if(!_add_page_to_content_with_routes(result, content, relative_path)){
-                free(relative_path);
-                free(full_file_path);
-                free(content);
-                break;
-            }
-
-            printf("Page %s added with content %s\n", relative_path, content);
-            free(full_file_path);
         }
         else if(file->d_type == DT_DIR){
-            printf("Found dir %s\n", file->d_name);
-            char *relative_dir_path = _concat_path(root_path, file->d_name);
-            bool status = _load_content_from_dir(relative_dir_path, result);
-            free(relative_dir_path);
-            return status;
+            return _load_content(core, root, relative_path);
         }
-    }
+    }    
 
-    free(full_root_path);
     closedir(root_dir);
     return true;
-#else
+exit_failure:
+    closedir(root_dir);
     return false;
-#endif
-
 }
 
-static bool _add_page_to_content_with_routes(Content *content, const char *page, const char *name){
-    printf("Adding page '%s'\n", name);
-    bool status = _add_page_to_content(content, page, name, name);
-    if(routes_json == NULL){
-        return status;
+static void _print_index(Index *index){
+    LOG_DEBUG("====Index===");
+    for(size_t i = 0; i < index->entry_count; i++){
+        IndexEntry entry = index->entries[i];
+        LOG_DEBUG("%s: %d (%s)", entry.path, entry.content.index, entry.content.full_path);
     }
-    cJSON *routes = cJSON_GetObjectItemCaseSensitive(routes_json, name);
-    if(routes == NULL){
-        return status;
-    }
-    if(!cJSON_IsArray(routes)){
-        fprintf(stderr, "Value for '%s' is not a valid array\n", name);
-        return status;
-    }
-    cJSON *route;
-    cJSON_ArrayForEach(route, routes)
-    {
-        if(!cJSON_IsString(route) || route->valuestring == NULL){
-            fprintf(stderr, "Found invalid string in routes array for '%s'\n", name);
-        }
-        else{
-            char *str = strdup(route->valuestring);
-            printf("Routing '%s' to '%s'\n", str, name);
-            status = status && _add_page_to_content(content, page, name, str);
-        }
-    }
-
-    return status;
+    LOG_DEBUG("");
 }
 
-
-bool _add_page_to_content(Content *content, const char *page, const char *name, const char *route){
-    if(content->page_count == content->page_buffer_size){
-        size_t new_page_buffer_size = content->page_buffer_size * 3 / 2;
-        Page *new_page_buffer = realloc(content->pages, new_page_buffer_size); 
-        if(new_page_buffer == NULL){
-            return false;
-        }
-        content->pages = new_page_buffer;
-        content->page_buffer_size = new_page_buffer_size;
-    }
-
-    content->pages[content->page_count] = (Page){
-        .page = page,
-        .name = name,
-        .route = route
+bool _init_handle(HttpCore *core, ContentHandle *handle, const char *absolute_path){
+    *handle = (ContentHandle){
+        .full_path = strdup(absolute_path),
+        .index = core->content_count++
     };
-    content->page_count++;
 
-    return true;
+    return handle->full_path != NULL;
 }
 
-
-static char *_load_content_file(const char *name){
-    assert(name);
-
-    char *content_path = getenv("CONTENT_PATH");
-    if(content_path == NULL){
-        fprintf(stderr, "CONTENT_PATH environment variable is not set\n");
-        return NULL;
+void _clear_handle(ContentHandle *handle){
+    if(handle == NULL){
+        return;
     }
-
-    char *path = malloc(strlen(content_path) + strlen(name) + 2);
-    sprintf(path, "%s/%s", content_path, name);
-
-    char *content = _read_file(path);
-    free(path);
-    return content;
-}
-
-
-static char *_read_file(const char *path){
-    FILE *f = fopen(path, "rb");
-    if(f == NULL){
-        fprintf(stderr, "Failed to open file '%s'\n", path);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    char *result = malloc(fsize + 1);
-    size_t size = fread(result, fsize, 1, f);
-    fclose(f);
-
-    if(size == 0){
-        fprintf(stderr, "Failed to read file '%s'\n", path);
-        free(result);
-        return NULL;
-    }
-
-    result[fsize] = 0;
-
-    return result;
+    free(handle->full_path);
 }
 
 static bool _is_valid_content(const char *file_name){
@@ -490,16 +259,6 @@ static bool _is_valid_content(const char *file_name){
     return false;
 }
 
-static ContentType _get_content_type(const char *file_name){
-    if(_has_file_extension(file_name, ".css")){
-        return CSS;
-    }
-    if(_has_file_extension(file_name, ".html")){
-        return HTML;
-    }
-    return Unknown;
-}
-
 static bool _has_file_extension(const char *file_name, const char *extension){
     assert(file_name);
     assert(extension);
@@ -511,25 +270,75 @@ static bool _has_file_extension(const char *file_name, const char *extension){
     return false;
 }
 
-static char *_get_full_content_path(const char *relative_path){
-    assert(relative_path != NULL);
+static size_t _concat_path(char *buffer, size_t buffer_size, const char *p1, const char *p2){
+    size_t p1_len = strlen(p1);
+    size_t p2_len = strlen(p2);
 
-    return _concat_path(_content_path, relative_path);
+    while(p1_len > 0 && p1[p1_len - 1] == '/'){
+        p1_len--;
+    }
+
+    while(p2_len > 0 && p2[0] == '/'){
+        p2_len--;
+        p2++;
+    }
+
+    p1_len = min(buffer_size, p1_len);
+    memcpy(buffer, p1, p1_len);
+    if(p1_len == buffer_size){
+        return p1_len;
+    }
+    buffer[p1_len] = '/';
+    if(p1_len + 1== buffer_size){
+        return p1_len + 1;
+    }
+    p2_len = min(buffer_size - p1_len - 1, p2_len);
+    memcpy(buffer + p1_len + 1, p2, p2_len);
+
+    if(p1_len + p2_len + 1 < buffer_size){
+        buffer[p1_len + 1 + p2_len] = 0;
+    }
+
+    return p1_len + p2_len + 1;
 }
 
-static char *_concat_path(const char *path1, const char *path2){
-    assert(path1 != NULL);
-    assert(path2 != NULL);
+static bool _index_init(Index *index){
+    assert(index != NULL);
+    *index = (Index){
+        .entries = calloc(DEFAULT_INDEX_BUFFER_COUNT, sizeof(IndexEntry)),
+        .entry_count = 0,
+        .entry_buffer_size = DEFAULT_INDEX_BUFFER_COUNT
+    };
 
-    char *result = malloc(strlen(path1) + strlen(path2) + 2);
-    if(result == NULL){
-        return NULL;
-    }
-    if(path1[strlen(path1) - 1] == '/' || path2[0] == '/' || strlen(path1) == 0 || strlen(path2) == 0){
-        sprintf(result, "%s%s", path1, path2);
-    }
-    else{
-        sprintf(result, "%s/%s", path1, path2);
-    }
-    return result;
+    return index->entries != NULL;
 }
+
+static bool _index_append(Index *index, IndexEntry entry){
+    if(index->entry_count == index->entry_buffer_size){
+        size_t new_size = index->entry_buffer_size * ENTRY_COUNT_SCALING_FACTOR;
+        assert(new_size > index->entry_buffer_size);
+        IndexEntry *entries = calloc(new_size, sizeof(IndexEntry));
+        if(entries == NULL){
+            return false;
+        }
+        free(index->entries);
+        index->entries = entries;
+        index->entry_buffer_size = new_size;
+    }
+
+    index->entries[index->entry_count++] = entry;
+    return true;
+}
+
+static bool _index_try_get_content_handle(Index *index, const char *path, size_t path_length, ContentHandle *handle){
+    for(size_t i = 0; i < index->entry_count; i++){
+        IndexEntry *entry = &index->entries[i];
+        if(strlen(entry->path) == path_length && strncmp(entry->path, path, path_length) == 0){
+            printf("Found for %s\n", entry->path);
+            *handle = entry->content;
+            return true;
+        }
+    }
+    return false;
+}
+

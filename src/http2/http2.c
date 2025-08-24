@@ -17,9 +17,9 @@ static size_t _to_external_frame(InternalFrameHeader frame, char *buffer, size_t
 static bool _ignore_frame(ParseBuffer *buffer);
 static bool _send(Http2Client *client, uint8_t *data, size_t size);
 
-Http2Client *http2_client_new(Http2SendCb cb){
-    assert(cb.send != NULL);
-    assert(cb.u_data != NULL);
+Http2Client *http2_client_new(Http2SendCb send_cb){
+    assert(send_cb.send != NULL);
+
     Http2Client *client = malloc(sizeof(Http2Client));
     if(client == NULL){
         return NULL;
@@ -31,7 +31,7 @@ Http2Client *http2_client_new(Http2SendCb cb){
         .highest_client_stream_id = 0,
         .streams = {0},
         .window_size = DEFAULT_WINDOW_SIZE,
-        .send_cb = cb
+        .send_cb = send_cb,
     };
 
     if(client->decoder == NULL || client->encoder == NULL){
@@ -66,10 +66,10 @@ Http2InternalStatus _connection_preface_message(Http2Client *client, ParseBuffer
     return InvaidConnectionPreface;
 }
 
-void http2_client_handle_message(Http2Client *client, const char *buff, size_t len){
+TaskList http2_client_handle_message_async(Http2Client *client, const char *buff, size_t len, CancellationToken *token){
     if(client == NULL){
         ERROR("Client is null");
-        return;
+        return task_list_empty();
     }
 
     printf("Handling http2\n");
@@ -106,6 +106,8 @@ void http2_client_handle_message(Http2Client *client, const char *buff, size_t l
 
     uint8_t buffer[4096];
 
+    TaskList task_list = task_list_empty();
+
     while(parse_buffer.parsed_size < parse_buffer.total_size){
         size_t initial_parsed_size = parse_buffer.parsed_size;
         LOG_DEBUG("Parsing frame of size %zu", parse_buffer.total_size - parse_buffer.parsed_size);
@@ -127,7 +129,7 @@ void http2_client_handle_message(Http2Client *client, const char *buff, size_t l
         InternalFrameHeader header = http2_frame_get_header(&frame);
 
         if(header.stream_id == 0){
-            default_stream_handle_message(client, &frame);
+            default_stream_handle_message_async(client, &frame, token);
             continue;
         }
 
@@ -159,7 +161,7 @@ void http2_client_handle_message(Http2Client *client, const char *buff, size_t l
         }
         if(stream == NULL){
             ERROR("Unable to find free stream");
-            return;
+            return task_list;
         }
         
         if(frame.type == RstStream){
@@ -173,34 +175,36 @@ void http2_client_handle_message(Http2Client *client, const char *buff, size_t l
             continue;
         }
 
+        Task task = completed_task();
         switch(stream->state){
             case Idle:
                 LOG_DEBUG("Handling message for idle stream %d", header.stream_id);
-                idle_stream_handle_message(client, stream, &frame);
+                task = idle_stream_handle_message_async(client, stream, &frame, token);
                 break;
             case Open:
                 LOG_DEBUG("Handling message for open stream %d", header.stream_id);
-                open_stream_handle_message(client, stream, &frame);
+                task = open_stream_handle_message_async(client, stream, &frame, token);
                 break;
             case HalfClosedRemote:
                 LOG_DEBUG("Handling message for half closed (remote) stream %d", header.stream_id);
-                half_closed_remote_handle_message(client, stream, &frame);
+                task = half_closed_remove_handle_message_async(client, stream, &frame, token);
                 break;
             default:
                 ERROR("Unable to handle stream in state %d", stream->state);
                 exit(EXIT_FAILURE);
-                return;
         }
+        task_list_add_task(&task_list, task);
 
         LOG_DEBUG("parsed %zu, total %zu", parse_buffer.parsed_size, parse_buffer.total_size);
 
         if(parse_buffer.parsed_size == initial_parsed_size){
             ERROR("Unable to handle message");
             exit(EXIT_FAILURE);
-            return;
         }
     }
     LOG_INFO("============== Message handled");
+
+    return task_list;
 }
 
 static bool _ignore_frame(ParseBuffer *buffer){
