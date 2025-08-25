@@ -1,10 +1,12 @@
 #include "hpack.h"
 #include "buffers.h"
 #include "hpack_primitives.h"
-#include "http2_logging.h"
 #include <assert.h>
 #include <stdlib.h>
 #include "hpack_table.h"
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
 

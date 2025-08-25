@@ -17,14 +17,19 @@
 #include <sys/syscall.h>
 #include "collections/slot_map.h"
 #include "errno.h"
+#include "log_levels.h"
 
-#define IO_URING_ENTRY_COUNT 32
+#define IO_URING_ENTRY_COUNT 4096
 
 #define max(x, y) ((x) > (y) ? (x) : (y))
 
-#define LOG_DEBUG_ENABLED
+#if LOG_LEVEL <= LOG_LEVEL_INFO
 #define LOG_INFO(format, ...) printf("[IOUring INFO] " format "\n", ##__VA_ARGS__)
-#ifdef LOG_DEBUG_ENABLED
+#else
+#define LOG_INFO(format, ...)
+#endif
+
+#if LOG_LEVEL <= LOG_LEVEL_DEBUG
 #define LOG_DEBUG(format, ...) printf("[IoUring Debug] " format "\n", ##__VA_ARGS__)
 #define ERROR(format, ...) fprintf(stderr,"[IoUring Error] " format "\n", ##__VA_ARGS__)
 #define ERRNO_ERROR(format, ...) fprintf(stderr,"[IoUring Error] " format "\n\t Reason: %s\n", strerror(errno), ##__VA_ARGS__)
@@ -61,6 +66,8 @@ struct IoUring{
     int stopfd;
     int eventfd;
     pthread_t thread;
+    atomic_size_t count;
+    pthread_mutex_t lock;
 };
 
 void *_run(void * data);
@@ -135,6 +142,10 @@ IoUring *io_uring_new(){
         goto exit_slot_map;
     }
     io_uring->slot_map = slot_map;
+    if(pthread_mutex_init(&io_uring->lock, 0) != 0){
+        ERROR("Unable to create io uring lock");
+        goto exit_slot_map;
+    }
 
     struct io_uring_params params = {0};
     int result = io_uring_setup(IO_URING_ENTRY_COUNT, &params);
@@ -198,6 +209,8 @@ IoUring *io_uring_new(){
         goto exit_slot_map;
     }
 
+    io_uring->count = 0;
+
     return io_uring;
 
 exit_slot_map:
@@ -240,8 +253,10 @@ void *_run(void * data){
 
                 uint64_t result;
                 while(_read_from_cq(uring, &result)){
+                    size_t count = atomic_fetch_sub(&uring->count, 1) - 1;
                     SlotMapHandle handle;
                     memcpy(&handle, &result, sizeof(handle));
+                    LOG_DEBUG("Uring dequeued item (index: %d, rev: %d). %zu items in flight.", handle.index, handle.revision, count);
                     IoUringCallback callback;
                     if(slot_map_try_get(uring->slot_map, handle, &callback)){
                         callback.invoke(callback.u_data);
@@ -261,21 +276,24 @@ void *_run(void * data){
 
 static bool _read_from_cq(IoUring *uring, uint64_t *result){
     unsigned int head = io_uring_smp_load_acquire(uring->ring.completion_ring.head);
-
     if(head == *uring->ring.completion_ring.tail){
         return false;
     }
 
+    bool success = true;
     struct io_uring_cqe *event = &uring->ring.completion_ring.entries[head & *uring->ring.completion_ring.mask];
     if(event->res < 0){
         printf("Penis\n");
-        return false;
+        success = false;
     }
+    else{
+        *result = event->user_data;
+    }
+
     head++;
     io_uring_smp_store_release(uring->ring.completion_ring.head, head);
 
-    *result = event->user_data;
-    return true;
+    return success;
 }
 
 bool io_uring_submit(IoUring *uring, IoUringOp op, IoUringCallback cb){
@@ -285,6 +303,7 @@ bool io_uring_submit(IoUring *uring, IoUringOp op, IoUringCallback cb){
         return false;
     }
 
+    pthread_mutex_lock(&uring->lock);
     unsigned int tail = *uring->ring.subbmission_ring.tail;
     unsigned int index = tail & *uring->ring.subbmission_ring.mask;
 
@@ -300,7 +319,11 @@ bool io_uring_submit(IoUring *uring, IoUringOp op, IoUringCallback cb){
 
     io_uring_smp_store_release(uring->ring.subbmission_ring.tail, tail);
 
-    int result = io_uring_enter(uring->ring.uring_fd, 1, 1, IORING_ENTER_GETEVENTS);
+    size_t count = atomic_fetch_add(&uring->count, 1) + 1;
+    LOG_DEBUG("Uring is enqueueing item number %zu (index: %d, rev: %d)", count, handle.index, handle.revision);
+    int result = io_uring_enter(uring->ring.uring_fd, 1, 0, 0);
+    LOG_DEBUG("Item enqueued");
+    pthread_mutex_unlock(&uring->lock);
     if(result < 0){
         perror("Enter ):");
         return false;

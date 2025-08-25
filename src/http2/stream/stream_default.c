@@ -1,9 +1,11 @@
 #include "http2_common.h"
 #include "http2_frame.h"
-#include "http2_logging.h"
 #include "stream.h"
 #include <assert.h>
 #include <stdlib.h>
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 static void _handle_settings(Http2Client *client, InternalSettingsFrame frame);
 static void _handle_window_update(Http2Client *client, InternalWindowUpdateFrame frame);

@@ -18,4 +18,6 @@ bool queue_fetch_count_and_try_dequeue(Queue *queue, void *result, size_t *old_e
 void queue_dequeue(Queue *queue, void *result);
 void queue_fetch_count_and_dequeue(Queue *queue, void *result, size_t *old_entry_count);
 
+size_t queue_size(Queue *queue);
+
 #endif

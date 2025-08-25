@@ -12,24 +12,17 @@
 #include <sys/eventfd.h>
 #include "fcntl.h"
 
-#define LOG_DEBUG_ENABLED
+#define LOG_CONTEXT "ServerWorker"
+#include "logging.h"
 
-#define LOG_INFO(format, ...) printf("[ServerWorker INFO] " format "\n", ##__VA_ARGS__)
-
-#ifdef LOG_DEBUG_ENABLED
+#if LOG_LEVEL <= LOG_LEVEL_ERROR
     static int _ssl_error_cb(const char *str, size_t len, void *u){
         fprintf(stderr, "[ServerWorker SSL Error] %s\n", str);
         return 1;
     }
-
-#define LOG_DEBUG(format, ...) printf("[ServerWorker Debug] " format "\n", ##__VA_ARGS__)
-#define ERROR(format, ...) fprintf(stderr,"[ServerWorker Error] " format "\n", ##__VA_ARGS__)
-#define ERRNO_ERROR(format, ...) fprintf(stderr,"[ServerWorker Error] " format "\n\t Reason: %s\n", strerror(errno), ##__VA_ARGS__)
-#define SSL_ERROR(format, ...) fprintf(stderr,"[ServerWorker Error] " format "\n", ##__VA_ARGS__); ERR_print_errors_cb(_ssl_error_cb, NULL)
+#define SSL_ERROR(format, ...) ERROR(format, ##__VA_ARGS__); ERR_print_errors_cb(_ssl_error_cb, NULL)
 #else
-#define LOG_DEBUG(format, ...)
-#define ERROR(format, ...)
-#define SSL_ERORR(format, ...)
+#define SSL_ERROR(format, ...)
 #endif
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
@@ -131,6 +124,8 @@ struct ServerWorker{
 
     ServerWorkerConfig config;
 };
+
+static int connections = 0;
 
 static bool _client_buffer_initialize(ClientBuffer *buffer);
 static void _client_buffer_clear(ClientBuffer *buffer);
@@ -421,6 +416,7 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
             continue;
         }
 
+        LOG_TRACE("Found %d epoll_events", epoll_result);
         for(size_t i = 0; i < epoll_result; i++){
             struct epoll_event event = events[i];
             if(event.data.fd == worker->stopfd){
@@ -437,7 +433,7 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
                 continue;
             }
             else if(event.data.fd == worker->socket){
-                LOG_INFO("Client connectiong");
+                LOG_INFO("Client connecting");
                 Client *client = _accept_client(worker);
                 if(client == NULL){
                     continue; 
@@ -499,10 +495,11 @@ static Client *_accept_client(ServerWorker *worker){
     assert(worker->socket > 0);
     assert(worker->ssl_ctx != NULL);
 
-    LOG_INFO("Accepting client...");
+    LOG_INFO("Accepting client... %d", connections);
 
     Client *client = malloc(sizeof(Client));
     if(client == NULL){
+        ERROR("Unable to allocate client data");
         return NULL;
     }
     *client = (Client){
@@ -513,6 +510,7 @@ static Client *_accept_client(ServerWorker *worker){
     };
 
     if(pthread_mutex_init(&client->write_lock, 0) != 0){
+        ERRNO_ERROR("Unable to iniitliaze client write mutex");
         goto exit_client;
     }
 
@@ -521,12 +519,13 @@ static Client *_accept_client(ServerWorker *worker){
     _data_buffer_initialize_empty(&client->out_buffer);
     socklen_t addrlen = sizeof(client->address);
 
-    LOG_DEBUG("Accept client");
     client->socket = accept(worker->socket, (struct sockaddr *)&client->address, &addrlen);
     if(client->socket < 0){
         ERRNO_ERROR("Accept error");
         goto exit_write_lock;
     }
+    LOG_DEBUG("Accept client %d", connections);
+    connections++;
 
 
     if(!_set_nonblocking(client->socket)){
@@ -606,7 +605,8 @@ static void _handle_write_signal(ServerWorker *worker){
             ClientHandle handle = write_clients[i];
             Client *client = _client_buffer_get_client(worker, handle);
             if(client == NULL){
-                LOG_INFO("Write buffer contains disconnected client, ignoring...");
+                LOG_WARNING("Write buffer contains disconnected client, ignoring...");
+                ERROR("Penis");
             }
             else{
                 if(client->status & Idle){
@@ -626,10 +626,13 @@ static void _handle_client_write(ServerWorker *worker, Client *client){
     assert(client->ssl != NULL);
     assert(client->status & (Idle | Writing));
 
+
     if(client->in_flight_out_buffer.used_size == 0){
+        pthread_mutex_lock(&client->write_lock);
         DataBuffer temp = client->in_flight_out_buffer;
         client->in_flight_out_buffer = client->out_buffer;
         client->out_buffer = temp;
+        pthread_mutex_unlock(&client->write_lock);
     }
 
     if(client->in_flight_out_buffer.used_size == 0){
@@ -758,6 +761,8 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     assert(client->socket > 0);
     assert(client->handle.index < worker->client_buffer.client_buffer_size);
 
+    LOG_DEBUG("Disconnecting client");
+
     if(client->has_been_connected && worker->disconnectCallback.invoke){
         worker->disconnectCallback.invoke(worker->disconnectCallback.u_data, client->u_client_data, client->handle);
     }
@@ -789,7 +794,14 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     if(epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, client->socket, NULL) < 0){
         ERRNO_ERROR("Unable to remove client for polling");
     }       
-    close(client->socket);
+
+    int status = SSL_shutdown(client->ssl);
+    assert(status == 1);
+
+    int close_stuats = close(client->socket);
+    if(close_stuats != 0){
+        ERRNO_ERROR("Unable to close socket");
+    }
     client->socket = -1;
     _client_buffer_remove(&worker->client_buffer, client);
 
@@ -807,7 +819,8 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     };
 
     free(client);
-    LOG_DEBUG("Client freed and disconnected");
+    connections--;
+    LOG_DEBUG("Client freed and disconnected, I have %d clients left", connections);
 }
 
 static void _client_set_status(ServerWorker *worker, Client *client, ClientStatus status){
@@ -910,7 +923,7 @@ static int _create_listen_socket(int port){
         return -1;
     }
 
-    if(listen(sockfd, 3) < 0){
+    if(listen(sockfd, 128) < 0){
         ERRNO_ERROR("Listen");
         return -1;
     }
@@ -922,7 +935,7 @@ static int _ip_str(struct sockaddr *sockaddr, char *result, size_t buffer_size){
     if(sockaddr->sa_family == AF_INET){
         struct sockaddr_in *sockaddr_ipv4 = (struct sockaddr_in *)sockaddr;
         uint8_t *addr = (uint8_t *)&sockaddr_ipv4->sin_addr.s_addr;
-        return snprintf(result, buffer_size, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);
+        return snprintf(result, buffer_size, "%d.%d.%d.%d:%d", addr[0], addr[1], addr[2], addr[3], sockaddr_ipv4->sin_port);
     }
     if(sockaddr->sa_family == AF_INET6){
         struct sockaddr_in6 *sockaddr_ipv6 = (struct sockaddr_in6 *)sockaddr;
@@ -1089,7 +1102,6 @@ static void _client_buffer_release_client(ServerWorker *worker, ClientHandle han
     assert(handle.index < worker->client_buffer.client_buffer_size);
 
     ClientEntry *entry = &worker->client_buffer.clients[handle.index];
-    assert(entry->generation == handle.generation);
 
     int prev = atomic_fetch_sub(&entry->accessor_count, 1);
     if(prev == 1){

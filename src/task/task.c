@@ -72,9 +72,6 @@ bool task_list_add_task(TaskList *task_list, Task task){
         task_list->_extended_tasks = new_extended_list;
         task_list->_extended_task_buffer_count = new_count;
     }
-    else{
-        assert(false);
-    }
 
     task_list->_extended_tasks[task_list->task_count++ - TASK_LIST_STACK_TASK_COUNT] = task;
 

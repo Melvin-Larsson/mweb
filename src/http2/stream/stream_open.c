@@ -1,8 +1,11 @@
 #include "http2_common.h"
 #include "http2_frame.h"
-#include "http2_logging.h"
 #include "stream/stream.h"
 #include <assert.h>
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
+
 
 static void _open_stream_handle_headers(Http2Client *client, Stream *stream, InternalHeaderFrame frame);
 static void _open_stream_handle_data(Http2Client *client, Stream *stream, InternalDataFrame frame);

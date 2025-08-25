@@ -2,7 +2,9 @@
 #include "frame_utils.h"
 #include "assert.h"
 #include <string.h>
-#include "http2_logging.h"
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 InternalDataFrame http2_frame_create_data_frame(uint8_t *data, size_t size, uint32_t stream_id){
     assert(stream_id != 0);

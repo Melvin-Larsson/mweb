@@ -25,6 +25,8 @@ struct Queue{
     pthread_rwlock_t lock;
     pthread_mutex_t dequeu_mutex;
     pthread_cond_t queue_not_empty_cond;
+
+    atomic_size_t count;
 };
 
 Queue *queue_new(size_t item_size){
@@ -55,6 +57,7 @@ Queue *queue_new(size_t item_size){
     queue->enqueue = 0;
     queue->dequeue = 0;
     queue->entry_count = DEFAULT_QUEUE_SIZE;
+    queue->count = 0;
 
     for(size_t i = 0; i < queue->entry_count; i++){
         Slot *slot = (Slot *)(queue->data + i * queue->slot_size);
@@ -144,6 +147,7 @@ bool _resize_queue(Queue *queue){
 }
 
 bool queue_fetch_count_and_enqueue(Queue *queue, void *data, size_t *old_entry_count){
+    atomic_fetch_add(&queue->count, 1);
     for(size_t i = 0; i < 4096; i++){
         pthread_rwlock_rdlock(&queue->lock);
         size_t enqueue_flat = atomic_load(&queue->enqueue);
@@ -230,4 +234,12 @@ void queue_fetch_count_and_dequeue(Queue *queue, void *result, size_t *old_entry
         pthread_cond_wait(&queue->queue_not_empty_cond, &queue->dequeu_mutex);
     }
     pthread_mutex_unlock(&queue->dequeu_mutex);
+}
+
+size_t queue_size(Queue *queue){
+    pthread_rwlock_rdlock(&queue->lock);
+    size_t dequeue = atomic_load(&queue->dequeue);
+    size_t enqueue = atomic_load(&queue->enqueue);
+    pthread_rwlock_unlock(&queue->lock);
+    return enqueue - dequeue;
 }

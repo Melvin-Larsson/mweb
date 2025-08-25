@@ -2,7 +2,9 @@
 #include "frame_utils.h"
 #include "assert.h"
 #include <string.h>
-#include "http2_logging.h"
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
 

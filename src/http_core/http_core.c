@@ -4,19 +4,11 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "io_uring/io_uring.h"
 
-#define LOG_DEBUG_ENABLED
-#define LOG_INFO(format, ...) printf("[HttpCore INFO] " format "\n", ##__VA_ARGS__)
-#ifdef LOG_DEBUG_ENABLED
-#define LOG_DEBUG(format, ...) printf("[HttpCore Debug] " format "\n", ##__VA_ARGS__)
-#define ERROR(format, ...) fprintf(stderr,"[HttpCore Error] " format "\n", ##__VA_ARGS__)
-#define ERRNO_ERROR(format, ...) fprintf(stderr,"[HttpCore Error] " format "\n\t Reason: %s\n", strerror(errno), ##__VA_ARGS__)
-#else
-#define LOG_DEBUG(format, ...)
-#define ERROR(format, ...)
-#define ERRNO_ERROR(format, ...)
-#endif
+#define LOG_CONTEXT "HttpCore"
+#include "logging.h"
 
 #define DEFAULT_INDEX_BUFFER_COUNT 32
 #define ENTRY_COUNT_SCALING_FACTOR 1.5
@@ -95,11 +87,14 @@ static off_t _file_size(const char *path) {
 }
 
 void _on_file_read(void *arg){
+    LOG_INFO("File read, handling response");
     ResponseCtx *ctx = (ResponseCtx *)arg;
     cancellation_token_remove_callback(ctx->token, ctx->handle);
     ctx->callback.invoke(ctx->callback.u_data, &ctx->result);
-    free(ctx->result.body);
+    free(ctx->result.body); //FIXME: I can not free memory owned by OS (io_uring)
     free(ctx);
+    close(ctx->fd);
+    LOG_DEBUG("Response handled");
 }
 
 static void _free_response_ctx(void *arg){
@@ -114,52 +109,77 @@ Task http_core_create_response_async(const HttpRequest *request, ResponseCallbac
         return completed_task();
     }
 
-    ContentHandle handle;
-    if(!_index_try_get_content_handle(&core.index, request->path, request->path_length, &handle)){
-        HttpResponse response = http_response_empty(HttpStatus404);
-        callback.invoke(callback.u_data, &response);
-        return completed_task();
-    }
+//     ContentHandle handle;
+//     if(!_index_try_get_content_handle(&core.index, request->path, request->path_length, &handle)){
+//         HttpResponse response = http_response_empty(HttpStatus404);
+//         callback.invoke(callback.u_data, &response);
+//         return completed_task();
+//     }
 
-    int fd = open(handle.full_path, O_RDONLY);
-    if(fd <= 0){
-        ERROR("Indexed file not found");
-        HttpResponse response = http_response_empty(HttpStatus404);
-        callback.invoke(callback.u_data, &response);
-        return completed_task();
-    }
+//     int fd = open(handle.full_path, O_RDONLY);
+//     if(fd <= 0){
+//         ERROR("Indexed file not found");
+//         HttpResponse response = http_response_empty(HttpStatus404);
+//         callback.invoke(callback.u_data, &response);
+//         return completed_task();
+//     }
 
-    off_t file_size = _file_size(handle.full_path);
-    if(file_size < 0){
-        return completed_task();
-    }
+//     off_t file_size = _file_size(handle.full_path);
+//     if(file_size < 0){
+//         return completed_task();
+//     }
 
-    ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
-    if(ctx == NULL){
-        ERROR("Unable to allocate response ctx");
-        return completed_task();
-    }
-    *ctx = (ResponseCtx){
-        .callback = callback,
-        .fd = fd,
-        .result = http_response_empty(HttpStatus200),
-        .token = token
-    };
-    ctx->result.body_size = file_size;
-    ctx->result.body = malloc(file_size);
-    if(ctx->result.body == NULL){
-        ERROR("Unable to allocate response body");
-        free(ctx);
-        return completed_task();
-    }
+    char *content = "\
+<!DOCTYPE html>\
+<html lang=\"en\">\
+    <head>\
+        <meta charset=\"UTF-8\" />\
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\
+        <title>Hello Web</title>\
+    </head>\
+    <body>\
+        <div class=\"container\">\
+            <h1>Hello World!</h1>\
+            <h2>I have served [SERVED_COUNT] pages!</h2>\
+            <h2>The time is [TIME]</h2>\
+        </div>\
+    </body>\
+</html>\
+";
 
-    CancellationTokenCallback cb = {
-        .on_cancel = _free_response_ctx,
-        .u_data = ctx
-    };
-    cancellation_token_add_callback(token, cb, &ctx->handle);
-    IoUringOp op = io_uring_read_op(fd, ctx->result.body, file_size);
-    return io_uring_task(_on_file_read, ctx, op);
+    HttpResponse response = http_response_empty(HttpStatus200);
+    response.body = (uint8_t *)content;
+    response.body_size = strlen(content);
+    callback.invoke(callback.u_data, &response);
+
+//     ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
+//     if(ctx == NULL){
+//         ERROR("Unable to allocate response ctx");
+//         return completed_task();
+//     }
+//     *ctx = (ResponseCtx){
+//         .callback = callback,
+//         .fd = fd,
+//         .result = http_response_empty(HttpStatus200),
+//         .token = token
+//     };
+//     ctx->result.body_size = file_size;
+//     ctx->result.body = malloc(file_size);
+//     if(ctx->result.body == NULL){
+//         ERROR("Unable to allocate response body");
+//         free(ctx);
+//         return completed_task();
+//     }
+
+    LOG_DEBUG("Enqueing work to load %.*s", (int)request->path_length, request->path);
+//     CancellationTokenCallback cb = {
+//         .on_cancel = _free_response_ctx,
+//         .u_data = ctx
+//     };
+//     cancellation_token_add_callback(token, cb, &ctx->handle);
+//     IoUringOp op = io_uring_read_op(fd, ctx->result.body, file_size);
+//     return io_uring_task(_on_file_read, ctx, op);
+    return completed_task();
 }
 
 static bool _load_content(HttpCore *core, const char *root, const char *path){
@@ -334,7 +354,6 @@ static bool _index_try_get_content_handle(Index *index, const char *path, size_t
     for(size_t i = 0; i < index->entry_count; i++){
         IndexEntry *entry = &index->entries[i];
         if(strlen(entry->path) == path_length && strncmp(entry->path, path, path_length) == 0){
-            printf("Found for %s\n", entry->path);
             *handle = entry->content;
             return true;
         }

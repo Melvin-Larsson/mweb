@@ -19,6 +19,9 @@
 #include "http2/http2.h"
 #include "io_uring/io_uring.h"
 
+#define LOG_CONTEXT "Server"
+#include "logging.h"
+
 #define TEST_NR 1
 
 #if TEST_NR == 0
@@ -53,17 +56,24 @@ void signal_handler(int signal){}
 
 bool send_cb(void *u_data, const uint8_t *data, size_t size){
     Client *client_data = (Client *)u_data;
-    printf("Send cb %zu\n", client_data->client.index);
     server_worker_send(sworker, client_data->client, (char *)data, size);
 
     return true;
 }
 
-void on_disconnect(void *u_data, void *u_client_data, const ClientHandle client){
-    Client *client_data = (Client *)u_client_data;
+void _on_disconnect_work(void *data){
+    LOG_DEBUG("Handle disconnect work");
+    Client *client_data = (Client *)data;
     cancellation_token_factory_cancel_and_free(client_data->token_factory);
     http2_client_free(client_data->http2Client);
+    threadpool_release_queue(thread_pool, client_data->queue);
     free(client_data);
+    LOG_INFO("Client disconnected");
+}
+void on_disconnect(void *u_data, void *u_client_data, const ClientHandle client){
+    Client *client_data = (Client *)u_client_data;
+    threadpool_enqueue_work(thread_pool, client_data->queue, _on_disconnect_work, client_data);
+    LOG_DEBUG("Client disconnect work enqued");
 }
 
 void on_connect(void *u_data, const ClientHandle client){
@@ -77,8 +87,6 @@ void on_connect(void *u_data, const ClientHandle client){
     CancellationToken *token = cancellation_token_factory_create_token(factory);
     assert(token != NULL);
 
-    assert(threadpool_try_create_new_queue(thread_pool, &client_data->queue));
-
     *client_data = (Client){
         .type = Http2,
         .client = client,
@@ -87,7 +95,11 @@ void on_connect(void *u_data, const ClientHandle client){
         .http2Client = http2Client
     };
 
+    assert(threadpool_try_create_new_queue(thread_pool, &client_data->queue));
+
     server_worker_attach_client_data(sworker, client, client_data);
+
+    LOG_INFO("Client connected");
 }
 
 typedef struct{
@@ -95,21 +107,35 @@ typedef struct{
     Task task;
 }Work;
 
-void on_iouring_done(void *args){
-    printf("Uring done\n");
+void _on_io_uring_done_work(void *args){
+    LOG_DEBUG("Uring done");
     Work *work = (Work *)args;
     UringTask uring_task = work->task.uring_task;
     uring_task.callback(uring_task.ctx);
     free(args);
+    LOG_INFO("Uring event handled\n");
 }
 
-void on_data(void *u, void *u_client_data, const ClientHandle client, char *buff, size_t len){
-    Client *client_data = (Client *)u_client_data;
-    TaskList tasks = http2_client_handle_message_async(client_data->http2Client, buff, len, client_data->token);
+void on_iouring_done(void *args){
+    Work *work = (Work *)args;
+    threadpool_enqueue_work(thread_pool, work->client->queue, _on_io_uring_done_work, work);
+}
+
+typedef struct{
+    Client *client;
+    char *buffer;
+    size_t data_size;
+}OnDataCtx;
+
+void _on_data_work(void *arg){
+    LOG_DEBUG("Handle client data work %X\n", arg);
+    OnDataCtx *ctx = (OnDataCtx *)arg;
+
+    TaskList tasks = http2_client_handle_message_async(ctx->client->http2Client, ctx->buffer, ctx->data_size, ctx->client->token);
     Task task;
     while(task_list_try_dequeue(&tasks, &task)){
         Work *work = malloc(sizeof(Work));
-        work->client = client_data;
+        work->client = ctx->client;
         work->task = task;
         IoUringCallback cb = {
             .invoke = on_iouring_done,
@@ -120,11 +146,29 @@ void on_data(void *u, void *u_client_data, const ClientHandle client, char *buff
         }
     }
 
+    free(ctx->buffer);
+    free(ctx);
     task_list_clear(&tasks);
+    LOG_INFO("Finished handling client data work %X\n", arg);
+}
+
+void on_data(void *u, void *u_client_data, const ClientHandle client, char *buff, size_t len){
+    Client *client_data = (Client *)u_client_data;
+    OnDataCtx *ctx = malloc(sizeof(OnDataCtx));
+    assert(ctx != NULL);
+    *ctx = (OnDataCtx){
+        .buffer = malloc(len),
+        .data_size = len,
+        .client = client_data
+    };
+    assert(ctx->buffer != NULL);
+    memcpy(ctx->buffer, buff, len);
+    threadpool_enqueue_work(thread_pool, client_data->queue, _on_data_work, ctx);
+    LOG_DEBUG("Enqueued client data work %X\n", ctx);
 }
 
 void error_handler(int signal){
-    printf("Signal %d received. Ignoring...\n", signal);
+    LOG_WARNING("Signal %d received. Ignoring...\n", signal);
 }
 
 int alpn_select_cb(SSL *ssl,
@@ -148,17 +192,6 @@ int alpn_select_cb(SSL *ssl,
 bool configure_ssl(void *data, SSL_CTX *ctx){
     SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
     return true;
-}
-
-char buff[1024] = {0};
-void on_read(void *data){
-    for(size_t i = 0; i < sizeof(buff); i++){
-        if(buff[i] == 0){
-            break;
-        }
-        printf("%c", buff[i]);
-    }
-    printf("\n");
 }
 
 int server_run(){
@@ -242,6 +275,7 @@ int server_run(){
     server_worker_run(sworker);
 
     server_worker_free(sworker);
+    threadpool_free(thread_pool);
 
 exit_manager:
     config_manager_free(manager);

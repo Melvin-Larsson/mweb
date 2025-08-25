@@ -1,6 +1,8 @@
-#include "http2_logging.h"
 #include "stream/stream.h"
 #include <assert.h>
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 
 Task half_closed_remove_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token){

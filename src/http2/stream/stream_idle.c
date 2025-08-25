@@ -1,8 +1,10 @@
 #include "http2_common.h"
 #include "http2_frame.h"
-#include "http2_logging.h"
 #include "stream/stream.h"
 #include "assert.h"
+
+#define LOGG_CONTEXT "Http2"
+#include "logging.h"
 
 Task idle_stream_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token){
     assert(stream->state == Idle);

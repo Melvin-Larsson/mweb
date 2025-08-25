@@ -8,7 +8,9 @@
 #include "stdlib.h"
 #include "assert.h"
 #include "http2_frame.h"
-#include "http2_logging.h"
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 static void _print_settings(InternalSettingsFrame *settings);
 static ParseStatus _parse_priority_data(char *buff, size_t len, InternalPriorityData *result);
@@ -72,6 +74,7 @@ TaskList http2_client_handle_message_async(Http2Client *client, const char *buff
         return task_list_empty();
     }
 
+#if LOG_LEVEL <= LOG_LEVEL_DEBUG
     printf("Handling http2\n");
     for(size_t i = 0; i < len; i++){
         printf("%02X ", (unsigned char)buff[i]);
@@ -89,6 +92,7 @@ TaskList http2_client_handle_message_async(Http2Client *client, const char *buff
             printf("?  ");
     }
     printf("\n");
+#endif
 
     ParseBuffer parse_buffer;
     buffers_init_parse_buffer(&parse_buffer, (uint8_t *)buff, len);
@@ -110,12 +114,6 @@ TaskList http2_client_handle_message_async(Http2Client *client, const char *buff
 
     while(parse_buffer.parsed_size < parse_buffer.total_size){
         size_t initial_parsed_size = parse_buffer.parsed_size;
-        LOG_DEBUG("Parsing frame of size %zu", parse_buffer.total_size - parse_buffer.parsed_size);
-        for(size_t i = 0; i < min(parse_buffer.total_size - parse_buffer.parsed_size, 32); i++){
-            printf("0x%X ", parse_buffer.data[parse_buffer.parsed_size + i]);
-        }
-        printf("\n");
-
         GenericFrame frame;
         ParseStatus status = http2_frame_parse(&parse_buffer, &frame);
         if(status == ParseStatusNotFullMessage){
@@ -146,7 +144,7 @@ TaskList http2_client_handle_message_async(Http2Client *client, const char *buff
             }
             else{
                 for(size_t i = 0; i < MAX_STREAMS_PER_CLIENT; i++){
-                    if(client->streams[i].id == 0){
+                    if(client->streams[i].state == Closed || client->streams[i].state == Idle){
                         stream = &client->streams[i];
                         *stream = (Stream){
                             .id = header.stream_id,

@@ -1,9 +1,11 @@
 #include "hpack_primitives.h"
 #include "huffman.h"
-#include "http2_logging.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 #define BITMASK(n) ((1U << (n)) - 1U)
 #define min(a, b) ((a) < (b) ? (a) : (b))

@@ -58,7 +58,6 @@ size_t http2_frame_serialize_header_frame(char *buffer, size_t size, InternalHea
     }
 
     Payload payload_info;
-    printf("Serialize of size %zu\n", payload_size);
     size_t used_size = http2_frame_serialize_padded_frame(buffer, size, payload_size, 0, &frame->header, &payload_info);
 
     size_t priority_size = 0;
@@ -68,7 +67,6 @@ size_t http2_frame_serialize_header_frame(char *buffer, size_t size, InternalHea
         payload_info.data += priority_size;
     }
 
-    printf("PI size %zu\n", payload_info.size);
     memcpy(payload_info.data, frame->header_block_fragment, payload_info.size);
 
     return used_size;

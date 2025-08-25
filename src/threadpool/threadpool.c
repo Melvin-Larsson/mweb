@@ -9,6 +9,9 @@
 #include <string.h>
 #include "queue.h"
 
+#define LOG_CONTEXT "ThreadPool"
+#include "logging.h"
+
 #define DEFAULT_QUEUE_COUNT 32
 #define QUEUE_COUNT_SCALING_FACTOR 1.5
 
@@ -31,6 +34,7 @@ typedef struct{
     Queue *queue;
     atomic_int revision;
     atomic_flag used;
+    atomic_bool is_processing;
     pthread_rwlock_t lock;
 }QueueEntry;
 
@@ -68,7 +72,7 @@ ThreadPool *threadpool_new(){
         return NULL;
     }
 
-    size_t thread_count = 8;
+    size_t thread_count = 4;
     *thread_pool = (ThreadPool){
         .stopping = false,
         .thread_count = thread_count,
@@ -134,6 +138,30 @@ void threadpool_free(ThreadPool *thread_pool){
     free(thread_pool);
 }
 
+static bool _set_processing_flag(QueueList *queues, ThreadPoolQueue queue, bool value){
+    QueueEntry *entry = _queue_list_aquire_queue_entry(queues, queue);
+    if(entry == NULL){
+        return false;
+    }
+
+    bool expected = !value;
+    bool status = atomic_compare_exchange_strong(&entry->is_processing, &expected, value);
+    _queue_list_release_queue_entry(queues, entry);
+    return status;
+}
+
+static bool _is_queue_empty(QueueList *queues, ThreadPoolQueue handle){
+    Queue *queue = _queue_list_aquire_queue(queues, handle);
+    if(queue == NULL){
+        return true;
+    }
+
+    size_t size = queue_size(queue);
+    _queue_list_release_queue(queues, handle);
+
+    return size == 0;
+}
+
 static void *_run(void *data){
     ThreadPool *thread_pool = (ThreadPool *)data;
     while(!thread_pool->stopping){
@@ -143,24 +171,32 @@ static void *_run(void *data){
             return NULL;
         }
 
+        if(!_set_processing_flag(&thread_pool->queues, global_item.client_queue, true)){
+            continue;
+        }
+
         Queue *queue = _queue_list_aquire_queue(&thread_pool->queues, global_item.client_queue);
         if(queue == NULL){
+            _set_processing_flag(&thread_pool->queues, global_item.client_queue, false);
             continue;
         }
 
         QueueItem item;
-        size_t old_count;
-        bool success = queue_fetch_count_and_try_dequeue(queue, &item, &old_count);
+        bool success = queue_try_dequeue(queue, &item);
         _queue_list_release_queue(&thread_pool->queues, global_item.client_queue);
         if(!success){
+            _set_processing_flag(&thread_pool->queues, global_item.client_queue, false);
             continue;
         }
         assert(item.invode != NULL);
         item.invode(item.u_data);
 
-        if(old_count > 1){
+        _set_processing_flag(&thread_pool->queues, global_item.client_queue, false);
+
+        if(!_is_queue_empty(&thread_pool->queues, global_item.client_queue)){
             queue_enqueue(thread_pool->global_queue, &global_item);
         }
+
     }
 
     return NULL;
@@ -178,6 +214,8 @@ bool threadpool_try_create_new_queue(ThreadPool *threadpool, ThreadPoolQueue *qu
         return false;
     }
 
+    LOG_INFO("Queue created at index %d, revision %d", queue->index, queue->revision);
+
     assert(queue_entry->queue == NULL);
 
     queue_entry->queue = queue_new(sizeof(QueueItem));
@@ -187,6 +225,7 @@ bool threadpool_try_create_new_queue(ThreadPool *threadpool, ThreadPoolQueue *qu
         atomic_flag_clear(&queue_entry->used);
         result = false;
     }
+    queue_entry->is_processing = false;
 
     _queue_list_release_queue_entry(&threadpool->queues, queue_entry);
     return result;
@@ -222,6 +261,7 @@ ThreadPoolStatus threadpool_enqueue_work(ThreadPool *threadpool, ThreadPoolQueue
 
 void threadpool_release_queue(ThreadPool *threadpool, ThreadPoolQueue queue_handle){
     _queue_list_remove_entry(&threadpool->queues, queue_handle); 
+    LOG_INFO("Queue at index %d, revision %d released", queue_handle.index, queue_handle.revision);
 }
 
 bool _init_queue_list(QueueList *queue_list){
@@ -275,9 +315,7 @@ bool _queue_list_resize(QueueList *queues){
         return false;
     }
     memcpy(new_list, queues->entries, queues->count * sizeof(QueueEntry));
-    printf("Free queue list\n");
     free(queues->entries);
-    printf("queue list freed\n");
     queues->entries = new_list;
     queues->count = new_count;
 
@@ -317,11 +355,8 @@ void _queue_list_remove_entry(QueueList *queues, ThreadPoolQueue queue){
         return;
     }
 
-    printf("Freesing index %d, rev %d\n", queue.index, queue.revision);
     pthread_rwlock_wrlock(&entry->lock);
-    printf("Free queue\n");
     queue_free(entry->queue);
-    printf("queue freed\n");
     entry->queue = NULL;
     atomic_flag_clear(&entry->used);
 

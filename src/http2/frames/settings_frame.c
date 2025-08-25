@@ -1,8 +1,10 @@
 #include "http2_frame.h"
 #include "frame_utils.h"
 #include "assert.h"
-#include "http2_logging.h"
 #include <string.h>
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 InternalSettingsFrame http2_frame_create_empty_settings_frame(){
     return (InternalSettingsFrame){

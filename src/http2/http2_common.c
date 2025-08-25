@@ -1,13 +1,16 @@
 #include "http2_common.h"
 #include "http_core/http_core.h"
-#include "http2_logging.h"
 #include <stdlib.h>
+
+#define LOG_CONTEXT "Http2"
+#include "logging.h"
 
 bool http2_common_send(Http2Client *client, uint8_t *data, size_t size){
     return client->send_cb.send(client->send_cb.u_data, data, size);
 }
 
 void http2_common_send_goaway(Http2Client *client, ErrorCode error_code){
+    ERROR("Sending goaway");
     InternalGoAwayFrame goaway = http2_frame_create_goaway_frame(client->highest_processed_stream_id, error_code);
     uint8_t buffer[512];
     size_t size = http2_frame_serialize_goaway_frame((char *)buffer, sizeof(buffer), &goaway);
@@ -29,8 +32,8 @@ static void _on_response_created(void *u_data, HttpResponse *response){
 
     cancellation_token_remove_callback(ctx->token, ctx->handle);
 
-    printf("Created response:\n%.*s\n", (int)response->body_size, (char *)response->body);
-    printf("With header fields\n");
+    LOG_INFO("Created response:\n%.*s", (int)response->body_size, (char *)response->body);
+    LOG_INFO("With header fields");
     http_header_fields_print(response->headers, response->header_count);
 
     uint8_t buffer_data[4096];
@@ -88,30 +91,12 @@ Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, Inte
     HttpHeaderField headers[32];
     size_t header_count = 0;
 
-    printf("body: \n");
-    for(size_t i = 0; i < 8; i++){
-        printf("%X ", (uint8_t)frame.header_block_fragment[i]);
-    }
-    printf("\n");
-
     HpackStatus status = hpack_decode_headers(client->decoder, &header_parse_buffer, headers, sizeof(headers) / sizeof(HttpHeaderField), &header_count, &buffer);
     if(status != HpackStatusOk){
         ERROR("Failed to parse headers, reason %d", status);
     }
     else if(buffer.used_size >= buffer.total_size){
         ERROR("Message headers too big for buffer, used %zu/%zu", buffer.used_size, buffer.total_size);
-    }
-    printf("Found %zu headers\n", header_count);
-    for(size_t i = 0; i < header_count; i++){
-        HttpHeaderField header = headers[i];
-        for(size_t i = 0; i < header.name_length; i++){
-            printf("%c", header.name[i]);
-        }
-        printf(": ");
-        for(size_t i = 0; i < header.value_length; i++){
-            printf("%c", header.value[i]);
-        }
-        printf("\n");
     }
 
     bool has_method = false;
@@ -189,7 +174,7 @@ Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, Inte
         .u_data = ctx,
     };
 
-    LOG_INFO("Asking for resposne %X", ctx);
+    LOG_DEBUG("Asking for resposne %X", ctx);
     CancellationTokenCallback cb = {
         .on_cancel = _free_response_ctx,
         .u_data = ctx
