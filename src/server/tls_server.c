@@ -49,7 +49,7 @@ TlsServerConfiguration tls_server_default_configuration(int port, const char *ce
 }
 
 TlsServer *tls_server_new(TlsServerConfiguration configuration){
-    LOG_DEBUG("Creating tls server with cert at '%s' and private key at '%s'", configuration.cert_file_path, configuration.private_key_path);
+    LOG_INFO("Creating tls server with %d threads, cert at '%s' and private key at '%s'", configuration.thread_count, configuration.cert_file_path, configuration.private_key_path);
     TlsServer *server = malloc(sizeof(TlsServer));
     pthread_t *threads = calloc(configuration.thread_count, sizeof(pthread_t));
     ServerWorker **workers = calloc(configuration.thread_count, sizeof(ServerWorker *));
@@ -106,13 +106,35 @@ exit_worker_ctx:
 }
 
 void tls_server_free(TlsServer *server){
+    for(size_t i = 0; i < server->configuration.thread_count; i++){
+        ServerWorker *worker = server->workers[i];
+        server_worker_request_stop(worker);
+    }
 
+    for(size_t i = 0; i < server->actual_thread_count; i++){
+        pthread_join(server->threads[i], NULL);
+    }   
+
+    for(size_t i = 0; i < server->configuration.thread_count; i++){
+        ServerWorker *worker = server->workers[i];
+        server_worker_free(worker);
+    }
+
+    free(server->threads);
+    free(server->worker_ctxs);
+    free(server->workers);
+
+    server->threads = NULL;
+    server->worker_ctxs = NULL;
+    server->workers = NULL;
+
+    free(server);
 }
 
 void tls_server_run(TlsServer *server){
     server->actual_thread_count = server->configuration.thread_count;
     for(size_t i = 0; i < server->configuration.thread_count; i++){
-        if(pthread_create(server->threads, 0, _run_worker, &server->worker_ctxs[i]) != 0){
+        if(pthread_create(&server->threads[i], 0, _run_worker, &server->worker_ctxs[i]) != 0){
             ERROR("Unable to create %d worker threads. Will only use %d workers", server->configuration, i);
             server->actual_thread_count = i;
             break;
@@ -176,9 +198,14 @@ static void _listen(TlsServer *server){
                 struct sockaddr_storage addr;
                 socklen_t addrlen = sizeof(addr);
                 int client_socket = accept(server->socket, (struct sockaddr *)&addr, &addrlen);
+                if(client_socket <= 0){
+                    ERRNO_ERROR("Invalid client socket");
+                    continue;
+                }
                 ServerWorker *worker = _schedule_worker(server);
                 assert(worker != NULL);
                 if(!server_worker_add_client(worker, client_socket, addr)){
+                    ERROR("Unable to add socket to worker %X, closing socket", worker);
                     close(client_socket);
                 }
             }
@@ -215,6 +242,18 @@ ServerStatus tls_server_send(TlsServer *server, const TlsServerClient client, co
     ServerWorker *worker = server->workers[client.worker];
     ClientHandle handle = _to_client_handle(client);
     ServerWorkerStatus status = server_worker_send(worker, handle, (const char *)buffer, buffer_size);
+    if(status == ServerWorkerClientDisconnected){
+        return ServerStatusClientDisconnected;
+    }
+    assert(status == ServerWorkerStatusOk);
+    return ServerStatusOk;
+}
+
+ServerStatus tls_server_enqueue_client_work(TlsServer *server, const TlsServerClient client, void (*work)(void *u_data), void *u_data){
+    LOG_TRACE("Enqueue client work");
+    ServerWorker *worker = server->workers[client.worker];
+    ClientHandle handle = _to_client_handle(client);
+    ServerWorkerStatus status = server_worker_enqueue_client_work(worker, handle, work, u_data);
     if(status == ServerWorkerClientDisconnected){
         return ServerStatusClientDisconnected;
     }

@@ -12,6 +12,7 @@ typedef struct{
 }ResponseCallback;
 
 bool http_core_init(const char *content_path);
+void http_core_free();
 void http_core_create_response(const HttpRequest *request, HttpResponse *response, Buffer *buffer);
 Task http_core_create_response_async(const HttpRequest *request, ResponseCallback callback, CancellationToken *token);
 

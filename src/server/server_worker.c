@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include "collections/queue.h"
 #include "fcntl.h"
 
 #define LOG_CONTEXT "ServerWorker"
@@ -73,6 +74,7 @@ typedef struct{
 }ClientEntry;
 
 typedef struct{
+    pthread_mutex_t lock;
     ClientEntry *clients;
     size_t client_buffer_size;
 }ClientBuffer;
@@ -106,6 +108,12 @@ typedef struct{
     bool (*invoke)(void *u_data, SSL_CTX *ctx);
 }ConfigureSSLCtxCallback;
 
+typedef struct{
+    void (*invoke)(void *u_data);
+    void *u_data;
+    ClientHandle handle;
+}WorkItem;
+
 struct ServerWorker{
     SSL_CTX *ssl_ctx;
     int stopfd;
@@ -121,10 +129,13 @@ struct ServerWorker{
     ConfigureSSLCtxCallback sslCtxCallback;
 
     ClientQueue write_queue;
-
     ServerWorkerConfig config;
 
+    Queue *work_queue;
+
     unsigned int client_count;
+
+    pthread_t thread;
 };
 
 static bool _client_buffer_initialize(ClientBuffer *buffer);
@@ -151,6 +162,7 @@ static bool _client_queue_resize_without_lock(ClientQueue *queue, size_t new_siz
 static SSL_CTX * _create_ssl_context(ServerWorkerConfig *config);
 static ServerWorkerStatus _listen(ServerWorker *worker);
 
+static void _handle_client_work(ServerWorker *worker);
 static void _handle_write_signal(ServerWorker *worker);
 static void _handle_client_write(ServerWorker *worker, Client *client);
 static void _handle_client_read(ServerWorker *worker, Client *client);
@@ -166,7 +178,10 @@ static bool _try_check_is_nonblocking(int fd, bool *result);
 
 ServerWorker *server_worker_new(ServerWorkerConfig config){
     ServerWorker *worker = malloc(sizeof(ServerWorker));
-    if(worker == NULL){
+    Queue *work_queue = queue_new(sizeof(WorkItem));
+    if(worker == NULL || work_queue == NULL){
+        free(worker);
+        queue_free(work_queue);
         return NULL;
     }
 
@@ -189,6 +204,7 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
         .disconnectCallback = {NULL, NULL},
         .config = config_copy,
         .client_count = 0,
+        .work_queue = work_queue
     };
 
     worker->stopfd = eventfd(0, 0);
@@ -215,8 +231,15 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
         goto exit_client_buffer;
     }
 
+    worker->ssl_ctx = _create_ssl_context(&worker->config);
+    if(worker->ssl_ctx == NULL){
+        goto exit_client_queue;
+    }
+
     return worker;
 
+exit_client_queue:
+    _client_queue_clear(&worker->write_queue);
 exit_epoll_fd:
     close(worker->epollfd);
 exit_client_buffer:
@@ -227,6 +250,7 @@ exit_stop_fd:
     close(worker->stopfd);
 exit_worker:
     free(worker);
+    queue_free(work_queue);
     return NULL;
 }
 
@@ -270,45 +294,47 @@ void server_worker_free(ServerWorker *worker){
         return;
     }
 
-    LOG_DEBUG("Freeing ssl ctx");
+    LOG_TRACE("Freeing ssl ctx");
     if(worker->ssl_ctx){
         SSL_CTX_free(worker->ssl_ctx);
         worker->ssl_ctx = NULL;
     }
 
-    LOG_DEBUG("Freeing epoll");
+    LOG_TRACE("Freeing epoll");
     if(worker->epollfd > 0){
         close(worker->epollfd);
         worker->epollfd = -1;
     }
 
-    LOG_DEBUG("Freeing stopdf");
+    LOG_TRACE("Freeing stopdf");
     if(worker->stopfd > 0){
         close(worker->stopfd);
         worker->stopfd = -1;
     }
 
-    LOG_DEBUG("Freeing client buffer");
+    LOG_TRACE("Freeing client buffer");
     _client_buffer_clear(&worker->client_buffer);
 
-    LOG_DEBUG("Freeing client queue");
+    LOG_TRACE("Freeing client queue");
     _client_queue_clear(&worker->write_queue);
 
-    LOG_DEBUG("Cert/private key paths");
+    LOG_TRACE("Freeing Cert/private key paths");
     free((char *)worker->config.cert_file_path);
     free((char *)worker->config.private_key_path);
+
+    LOG_TRACE("Freeing work queue");
+    queue_free(worker->work_queue);
+    worker->work_queue = NULL;
 
     free(worker);
 }
 
 ServerWorkerStatus server_worker_run(ServerWorker *worker){
     assert(worker != NULL);
-    assert(worker->ssl_ctx ==NULL);
+    assert(worker->ssl_ctx != NULL);
 
-    worker->ssl_ctx = _create_ssl_context(&worker->config);
-    if(worker->ssl_ctx == NULL){
-        return ServerWorkerUnableToCreateSSLContext;
-    }
+    worker->thread = pthread_self();
+
     if(worker->sslCtxCallback.invoke && 
             !worker->sslCtxCallback.invoke(worker->sslCtxCallback.u_data, worker->ssl_ctx)){
         return ServerWorkerUnableToCreateSSLContext;
@@ -320,19 +346,34 @@ ServerWorkerStatus server_worker_run(ServerWorker *worker){
 ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle handle, const char *buffer, size_t buffer_size){
     assert(worker != NULL);
     assert(buffer != NULL);
+    assert(pthread_equal(pthread_self(), worker->thread)); //Doesn't work with valgrind
     Client *client = _client_buffer_get_client(worker, handle);
     if(client == NULL){
         return ServerWorkerClientDisconnected;
     }
 
-    pthread_mutex_lock(&client->write_lock);
+/*     pthread_mutex_lock(&client->write_lock); */
 
     _data_buffer_add(&client->out_buffer, buffer, buffer_size);
-    _client_queue_enqueue(&worker->write_queue, handle);
+    _handle_client_write(worker, client);
+/*     _client_queue_enqueue(&worker->write_queue, handle); */
 
-    pthread_mutex_unlock(&client->write_lock);
+/*     pthread_mutex_unlock(&client->write_lock); */
 
     _client_buffer_release_client(worker, handle);
+
+    return ServerWorkerStatusOk;
+}
+
+ServerWorkerStatus server_worker_enqueue_client_work(ServerWorker *worker, ClientHandle handle, void (*work)(void *u_data), void *u_data){
+    WorkItem work_item = {
+        .invoke = work,
+        .u_data = u_data,
+        .handle = handle
+    };
+    queue_enqueue(worker->work_queue, &work_item);
+    uint64_t dummy = 1;
+    write(worker->eventfd, &dummy, sizeof(dummy));
 
     return ServerWorkerStatusOk;
 }
@@ -349,26 +390,20 @@ unsigned int server_worker_get_workload_weight(ServerWorker *worker){
     return worker->client_count;
 }
 
-bool server_worker_add_client(ServerWorker *worker, int socket, struct sockaddr_storage addres){
+typedef struct{
+    ServerWorker *worker;
+    Client *client;
+}AddClientCtx;
+
+void _add_client(void *args){
+    AddClientCtx *ctx = (AddClientCtx *)args;
+    ServerWorker *worker = ctx->worker;
+    Client *client = ctx->client;
     assert(worker != NULL);
     assert(worker->ssl_ctx != NULL);
     assert(worker->epollfd > 0);
     assert(worker->eventfd > 0);
-
-    LOG_INFO("Accepting client... %d", worker->client_count);
-
-    Client *client = malloc(sizeof(Client));
-    if(client == NULL){
-        ERROR("Unable to allocate client data");
-        return false;
-    }
-    *client = (Client){
-        .has_been_connected = false,
-        .ssl = NULL,
-        .socket = socket,
-        .u_client_data = NULL,
-        .address = addres
-    };
+    free(ctx);
 
     if(pthread_mutex_init(&client->write_lock, 0) != 0){
         ERRNO_ERROR("Unable to iniitliaze client write mutex");
@@ -392,11 +427,6 @@ bool server_worker_add_client(ServerWorker *worker, int socket, struct sockaddr_
 
     if(SSL_set_fd(client->ssl, client->socket) == 0){
         SSL_ERROR("Unable to set fd");
-        goto exit_ssl;
-    }
-
-    if(!_client_buffer_add(&worker->client_buffer, client)){
-        ERROR("Unable to store client in buffer.");
         goto exit_ssl;
     }
 
@@ -434,8 +464,9 @@ bool server_worker_add_client(ServerWorker *worker, int socket, struct sockaddr_
     char buff[128];
     _ip_str((struct sockaddr *)&client->address, buff, sizeof(buff));
     LOG_INFO("Client nr %d with ip %s connected", worker->client_count, buff);
+    worker->client_count++;
 
-    return true;
+    return;
 
 exit_client_buffer:
     _client_buffer_remove(&worker->client_buffer, client);
@@ -447,7 +478,45 @@ exit_write_lock:
 exit_client:
     client->socket = -1;
     free(client);
-    return false;
+    return;
+}
+
+bool server_worker_add_client(ServerWorker *worker, int socket, struct sockaddr_storage addres){
+    LOG_INFO("Accepting client... %d", worker->client_count);
+
+    Client *client = malloc(sizeof(Client));
+    if(client == NULL){
+        ERROR("Unable to allocate client data");
+        return false;
+    }
+    *client = (Client){
+        .has_been_connected = false,
+        .ssl = NULL,
+        .socket = socket,
+        .u_client_data = NULL,
+        .address = addres
+    };
+
+    if(!_client_buffer_add(&worker->client_buffer, client)){
+        ERROR("Unable to store client in buffer.");
+        free(client);
+        return false;
+    }
+
+    AddClientCtx *ctx = malloc(sizeof(AddClientCtx));
+    if(ctx == NULL){
+        _client_buffer_remove(&worker->client_buffer, client);
+        free(client);
+        assert(false);
+        return false;
+    }
+    *ctx = (AddClientCtx){
+        .client = client,
+        .worker = worker,
+    };
+    server_worker_enqueue_client_work(worker, client->handle, _add_client, ctx);
+
+    return true;
 }
 
 static ServerWorkerStatus _listen(ServerWorker *worker){
@@ -530,6 +599,11 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
             }
             else if(event.data.fd == worker->eventfd){
                 LOG_TRACE("Event signal received");
+
+                LOG_TRACE("Handling client work");
+                _handle_client_work(worker);
+                LOG_DEBUG("Client work handled");
+
                 uint64_t buff = 0;
                 read(worker->eventfd, &buff, sizeof(buff));
                 LOG_TRACE("Event signal handled");
@@ -570,6 +644,20 @@ exit_stop_fd:
     return status;
 }
 
+static void _handle_client_work(ServerWorker *worker){
+    WorkItem item;
+    while(queue_try_dequeue(worker->work_queue, &item)){
+        //Validate that client still exists. (Note that since we are single threaded, it will keep existing even if I don't aquire it)
+        Client *client = _client_buffer_get_client(worker, item.handle);
+        if(client == NULL){
+            continue;
+        }
+        item.invoke(item.u_data);
+
+        _client_buffer_release_client(worker, item.handle);
+    }
+}
+
 static void _handle_write_signal(ServerWorker *worker){
     assert(worker != NULL);
 
@@ -604,18 +692,21 @@ static void _handle_client_write(ServerWorker *worker, Client *client){
     assert(worker != NULL);
     assert(client != NULL);
     assert(client->ssl != NULL);
-    assert(client->status & (Idle | Writing));
+/*     assert(client->status & (Idle | Writing)); */
 
+    LOG_TRACE("Handle client write");
 
     if(client->in_flight_out_buffer.used_size == 0){
-        pthread_mutex_lock(&client->write_lock);
+        LOG_TRACE("Swapping client buffers");
+/*         pthread_mutex_lock(&client->write_lock); */
         DataBuffer temp = client->in_flight_out_buffer;
         client->in_flight_out_buffer = client->out_buffer;
         client->out_buffer = temp;
-        pthread_mutex_unlock(&client->write_lock);
+/*         pthread_mutex_unlock(&client->write_lock); */
     }
 
     if(client->in_flight_out_buffer.used_size == 0){
+        LOG_DEBUG("Nothing to write");
         return;
     }
 
@@ -629,6 +720,9 @@ static void _handle_client_write(ServerWorker *worker, Client *client){
             _disconnect_and_free_client(worker, client);
             return;
         }
+    }
+    else{
+        LOG_DEBUG("Succesfully wrote data to client");
     }
 
     client->in_flight_out_buffer.used_size = 0;
@@ -915,9 +1009,16 @@ static bool _client_buffer_initialize(ClientBuffer *buffer){
         .client_buffer_size = CLIENT_BUFFER_DEFAULT_SIZE,
         .clients = calloc(CLIENT_BUFFER_DEFAULT_SIZE, sizeof(ClientEntry))
     };
+    if(buffer->clients == NULL){
+        return false;
+    }
+    if(pthread_mutex_init(&buffer->lock, 0) != 0){
+        ERRNO_ERROR("Unable to create client buffer lock");
+        free(buffer->clients);
+        return false;
+    }
 
-    LOG_DEBUG("First has %lu", buffer->clients[0].generation);
-    return buffer->clients != NULL;
+    return true;
 }
 
 static void _client_buffer_clear(ClientBuffer *buffer){
@@ -925,6 +1026,9 @@ static void _client_buffer_clear(ClientBuffer *buffer){
     if(buffer == NULL){
         return;
     }
+
+    pthread_mutex_destroy(&buffer->lock);
+
     if(buffer->clients == NULL){
         return;
     }
@@ -948,10 +1052,13 @@ static bool _client_buffer_add(ClientBuffer *buffer, Client *client){
     assert(buffer != NULL);
     assert(client != NULL);
 
+    pthread_mutex_lock(&buffer->lock);
+
     if(buffer->clients == NULL || buffer->client_buffer_size < CLIENT_BUFFER_DEFAULT_SIZE){
         LOG_DEBUG("Invalid client buffer size (%zX, %zu). Will resize", buffer->client_buffer_size, buffer->client_buffer_size);
         ClientEntry *new_buffer = calloc(CLIENT_BUFFER_DEFAULT_SIZE, sizeof(ClientEntry));
         if(new_buffer == NULL){
+            pthread_mutex_unlock(&buffer->lock);
             return false;
         }
         memcpy(new_buffer, buffer->clients, buffer->client_buffer_size * sizeof(ClientEntry));
@@ -974,6 +1081,7 @@ static bool _client_buffer_add(ClientBuffer *buffer, Client *client){
         assert(new_size > buffer->client_buffer_size);
         ClientEntry *new_buffer = realloc(buffer->clients, new_size * sizeof(ClientEntry));
         if(new_buffer == NULL){
+            pthread_mutex_unlock(&buffer->lock);
             return false;
         }
         free_index = buffer->client_buffer_size;
@@ -995,9 +1103,11 @@ static bool _client_buffer_add(ClientBuffer *buffer, Client *client){
     if(pthread_cond_init(&entry->no_accessors, 0) != 0){
         entry->client = NULL;
         ERRNO_ERROR("Unable to create \"no accessors\" condition");
+        pthread_mutex_unlock(&buffer->lock);
         return false;
     }
 
+    pthread_mutex_unlock(&buffer->lock);
     return true;
 }
 
@@ -1008,12 +1118,16 @@ static void _client_buffer_remove(ClientBuffer *buffer, Client *client){
     assert(client->handle.index >= 0);
     assert(client->handle.index < buffer->client_buffer_size);
 
+    pthread_mutex_lock(&buffer->lock);
+
     ClientEntry *entry = &buffer->clients[client->handle.index];
-//     assert(entry->generation == client->handle.generation);
+//     assert(entry->generation == client->handle.generation); //Becuas I increment this in disconnect
     assert(atomic_load(&entry->accessor_count) == 0);
 
     entry->client = NULL;
     pthread_cond_destroy(&entry->no_accessors);
+
+    pthread_mutex_unlock(&buffer->lock);
 }
 
 static Client *_client_buffer_get_client(ServerWorker *worker, ClientHandle handle){

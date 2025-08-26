@@ -1,11 +1,13 @@
 #ifndef HTTP_MESSAGE_H
 #define HTTP_MESSAGE_H
 
+#include "buffers.h"
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdalign.h>
 
 typedef enum{
     GET,
@@ -84,6 +86,61 @@ static inline HttpHeaderField http_header_field_from_str(char *name, char *value
         .name_length = strlen(name),
         .value_length = strlen(value)
     };
+}
+
+static inline size_t http_header_fields_get_length(HttpHeaderField *fields, size_t count){
+    size_t size = 0;
+    for(size_t i = 0; i < count; i++){
+        HttpHeaderField *field = &fields[i];
+        size += field->name_length + field->value_length;
+    }   
+    return size;
+}
+
+static inline size_t http_header_fields_strs_to_buffer(HttpHeaderField *fields, size_t count, Buffer *buffer){
+    size_t size = 0;
+    for(size_t i = 0; i < count; i++){
+        HttpHeaderField *field = &fields[i];
+        uint8_t *name_ptr = buffer_get_append_ptr(buffer);
+        size += buffers_append(buffer, (uint8_t *)field->name, field->name_length);
+        uint8_t *value_ptr = buffer_get_append_ptr(buffer);
+        size += buffers_append(buffer, (uint8_t *)field->value, field->value_length);
+
+        field->name = (char *)name_ptr;
+        field->value = (char *)value_ptr;
+    }
+
+    return size;
+}
+
+static inline HttpHeaderField *http_header_fields_to_buffer(HttpHeaderField *fields, size_t count, Buffer *buffer){
+    http_header_fields_strs_to_buffer(fields, count, buffer);
+
+    const int alignment = alignof(HttpHeaderField);
+    while(buffer->used_size % alignment != 0){
+        buffer->used_size++;
+    }
+    if(buffer->used_size >= buffer->total_size){
+        buffer->used_size = buffer->total_size;
+        return NULL;
+    }
+
+    HttpHeaderField *result = (HttpHeaderField *)&buffer->data[buffer->used_size];
+    HttpHeaderField *curr = result;
+    for(size_t i = 0; i < count; i++){
+        size_t size_left = buffer_size_left(buffer);
+        if(size_left >= sizeof(HttpHeaderField)){
+            memcpy(curr, &fields[i], sizeof(HttpHeaderField));
+            buffer->used_size += sizeof(HttpHeaderField);
+            curr++;
+        }
+        else{
+            buffer->used_size = buffer->total_size;
+            return result;
+        }
+    }
+
+    return result;
 }
 
 static inline HttpHeaderField http_status_header_field(HttpStatus status){

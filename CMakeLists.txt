@@ -56,11 +56,11 @@ set(TASK_SOURCES
 set(COLLECTIONS_SOURCES
     src/collections/slot_map.c
     src/collections/arraylist.c
+    src/collections/queue.c
 )
 
 set(THREADPOOL_SOURCES
     src/threadpool/threadpool.c
-    src/threadpool/queue.c
     src/threadpool/cancellation_token.c
 )
 
@@ -90,6 +90,7 @@ target_link_libraries(libserver PRIVATE libhttp2)
 target_link_libraries(libserver PRIVATE libthreadpool)
 target_link_libraries(libserver PRIVATE libiouring)
 target_link_libraries(libserver PRIVATE libtask)
+target_link_libraries(libserver PRIVATE libcollections)
 
 target_include_directories(libhttp2 PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libhttp2 PRIVATE ${PROJECT_SOURCE_DIR}/src/http2 ${PROJECT_SOURCE_DIR}/src/common)

@@ -48,5 +48,6 @@ void tls_server_run(TlsServer *server);
 
 ServerStatus tls_server_send(TlsServer *server, const TlsServerClient client, const uint8_t *buffer, size_t buffer_size);
 ServerStatus tls_server_attach_client_data(TlsServer *server, const TlsServerClient client, void *u_client_data);
+ServerStatus tls_server_enqueue_client_work(TlsServer *server, const TlsServerClient client, void (*work)(void *u_data), void *u_data);
 
 #endif

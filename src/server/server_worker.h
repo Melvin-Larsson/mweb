@@ -43,6 +43,7 @@ void server_worker_set_disconnect_callback(ServerWorker *worker, void (*callback
 ServerWorkerStatus server_worker_attach_client_data(ServerWorker *worker, const ClientHandle client, void *u_client_data);
 
 ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle client, const char *buffer, size_t buffer_size);
+ServerWorkerStatus server_worker_enqueue_client_work(ServerWorker *worker, ClientHandle client, void (*work)(void *u_data), void *u_data);
 
 void server_worker_request_stop(ServerWorker *worker);
 

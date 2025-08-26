@@ -47,28 +47,33 @@ static void _on_response_created(void *u_data, HttpResponse *response){
     assert(!buffer_size_is_full(&buffer));
 
     InternalHeaderFrame header_frame = http2_frame_create_header_frame(response_headers, header_size, stream->id, true);
-    InternalDataFrame data_frame = http2_frame_create_data_frame(response->body, response->body_size, stream->id);
-    data_frame.header.flags |= END_STREAM;
     if(response->body_size == 0){
         header_frame.header.flags |= END_STREAM;
+        LOG_TRACE("Last frame");
     }
 
     uint8_t *frame_ptr = buffer_get_append_ptr(&buffer);
-    size_t total_size = 0;
-    size_t size_left = buffer_size_left(&buffer);
-    size_t headers_size = http2_frame_serialize_header_frame((char *)frame_ptr, size_left, &header_frame);
-    size_left -= headers_size;
-    total_size += headers_size;
-    if(response->body_size > 0){
-        size_t data_size = http2_frame_serialize_data_frame((char *)frame_ptr + headers_size, size_left, &data_frame);
-        size_left -= data_size;
-        total_size += data_size;
+    size_t headers_size = http2_frame_serialize_header_frame((char *)frame_ptr, buffer_size_left(&buffer), &header_frame);
+    http2_common_send(client, frame_ptr, headers_size);
+
+    size_t size_left = response->body_size;
+    uint8_t *data_ptr = response->body;
+    while(size_left > 0){
+        LOG_TRACE("Sending data frame, %d bytes left", size_left);
+        size_t send_size = min(size_left, 4096);
+        uint8_t buffer[4196];
+        InternalDataFrame frame = http2_frame_create_data_frame(data_ptr, send_size, stream->id);
+        if(size_left == send_size){
+            frame.header.flags |= END_STREAM;
+            LOG_TRACE("Last frame");
+        }
+
+        size_t frame_size = http2_frame_serialize_data_frame((char *)buffer, sizeof(buffer), &frame);
+        http2_common_send(client, buffer, frame_size);
+
+        data_ptr += send_size;
+        size_left -= send_size;
     }
-
-    assert(size_left != 0);
-
-    LOG_DEBUG("Sending %zu bytes to client", total_size);
-    http2_common_send(client, frame_ptr, total_size);
 
     stream->state = Closed;
 

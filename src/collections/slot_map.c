@@ -155,6 +155,7 @@ exit_failure:
 void slot_map_remove(SlotMap *slot_map, SlotMapHandle handle){
     pthread_rwlock_rdlock(&slot_map->lock);
     if(handle.index >= slot_map->slot_count){
+        assert(false);
         goto exit;
     }
     Slot *slot = (Slot *)(slot_map->slots + handle.index * slot_map->slot_size);

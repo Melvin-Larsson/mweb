@@ -19,6 +19,7 @@
 #include "errno.h"
 #include "log_levels.h"
 
+// #define USE_POLLING
 #define IO_URING_ENTRY_COUNT 4096
 
 #define max(x, y) ((x) > (y) ? (x) : (y))
@@ -43,6 +44,7 @@ typedef struct{
     unsigned int *tail;
     unsigned int *array;
     unsigned int *mask;
+    unsigned int *flags;
     struct io_uring_sqe *entries;
 }SubmissionRing;
 
@@ -148,6 +150,10 @@ IoUring *io_uring_new(){
     }
 
     struct io_uring_params params = {0};
+#ifdef USE_POLLING
+    params.flags = IORING_SETUP_SQPOLL;
+    params.sq_thread_idle = 1000;
+#endif
     int result = io_uring_setup(IO_URING_ENTRY_COUNT, &params);
     if(result < 0){
         goto exit_slot_map;
@@ -183,7 +189,8 @@ IoUring *io_uring_new(){
     io_uring->ring.subbmission_ring = (SubmissionRing){
         .tail = submission_queue_ptr + params.sq_off.tail,
         .array = submission_queue_ptr + params.sq_off.array,
-        .mask = submission_queue_ptr + params.sq_off.ring_mask
+        .mask = submission_queue_ptr + params.sq_off.ring_mask,
+        .flags = submission_queue_ptr + params.sq_off.flags
     };
     io_uring->ring.completion_ring = (CompletionRing){
         .head = submission_queue_ptr + params.cq_off.head,
@@ -321,7 +328,15 @@ bool io_uring_submit(IoUring *uring, IoUringOp op, IoUringCallback cb){
 
     size_t count = atomic_fetch_add(&uring->count, 1) + 1;
     LOG_DEBUG("Uring is enqueueing item number %zu (index: %d, rev: %d)", count, handle.index, handle.revision);
+#ifdef USE_POLLING
+    int result = 1;
+    unsigned flags = atomic_load_explicit((atomic_uint *)uring->ring.subbmission_ring.flags, memory_order_relaxed);
+    if (flags & IORING_SQ_NEED_WAKEUP){
+        result = io_uring_enter(uring->ring.uring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP);
+    }
+#else
     int result = io_uring_enter(uring->ring.uring_fd, 1, 0, 0);
+#endif
     LOG_DEBUG("Item enqueued");
     pthread_mutex_unlock(&uring->lock);
     if(result < 0){

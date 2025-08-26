@@ -94,21 +94,60 @@ void on_connect(void *u_data, const TlsServerClient client){
 }
 
 typedef struct{
+    bool canceled;
+    bool owned_by_io_uring;
     Client *client;
+    pthread_mutex_t lock;
     Task task;
+    CancellationTokenCallbackHandle cch;
 }Work;
 
 void _on_io_uring_done_work(void *args){
-    LOG_DEBUG("Uring done");
     Work *work = (Work *)args;
+    LOG_DEBUG("Uring done");
+
     UringTask uring_task = work->task.uring_task;
     uring_task.callback(uring_task.ctx);
-    free(args);
+
+    cancellation_token_remove_callback(work->client->token, work->cch);
+    pthread_mutex_destroy(&work->lock);
+    free(work);
     LOG_INFO("Uring event handled\n");
 }
 
 void on_iouring_done(void *args){
     Work *work = (Work *)args;
+
+    pthread_mutex_lock(&work->lock);
+    if(!work->canceled){
+        LOG_TRACE("Handling io_uring result");
+        work->owned_by_io_uring = false;
+        pthread_mutex_unlock(&work->lock);
+
+        tls_server_enqueue_client_work(server, work->client->client, _on_io_uring_done_work, work);
+    }
+    else{
+        pthread_mutex_unlock(&work->lock);
+        LOG_DEBUG("Ignoring iouring completion, task canceled");
+        UringTask uring_task = work->task.uring_task;
+        IoUringOp op = uring_task.op;
+        free(op.buff);
+        close(op.fd);
+        pthread_mutex_destroy(&work->lock);
+        free(work);
+    }
+
+}
+
+void _free_work_from_uring(void *args){
+    Work *work = (Work *)args;
+    pthread_mutex_lock(&work->lock);
+    work->canceled = true;
+    pthread_mutex_unlock(&work->lock);
+    if(!work->owned_by_io_uring){
+        pthread_mutex_destroy(&work->lock);
+        free(work);
+    }
 }
 
 typedef struct{
@@ -116,9 +155,6 @@ typedef struct{
     char *buffer;
     size_t data_size;
 }OnDataCtx;
-
-void _on_data_work(void *arg){
-}
 
 void on_data(void *u, void *u_client_data, uint8_t *buff, size_t len){
     LOG_DEBUG("Handle client data work %X\n", u_client_data);
@@ -130,6 +166,9 @@ void on_data(void *u, void *u_client_data, uint8_t *buff, size_t len){
         Work *work = malloc(sizeof(Work));
         work->client = client;
         work->task = task;
+        work->canceled = false;
+        work->owned_by_io_uring = true;
+        assert(pthread_mutex_init(&work->lock, 0) == 0);
         IoUringCallback cb = {
             .invoke = on_iouring_done,
             .u_data = work
@@ -137,6 +176,11 @@ void on_data(void *u, void *u_client_data, uint8_t *buff, size_t len){
         if(task.type == TaskTypeUring){
             io_uring_submit(uring, task.uring_task.op, cb);
         }
+        CancellationTokenCallback ccb = {
+            .on_cancel = _free_work_from_uring,
+            .u_data = work,
+        };
+        cancellation_token_add_callback(client->token, ccb, &work->cch);
     }
 
     task_list_clear(&tasks);
@@ -225,6 +269,7 @@ int server_run(){
     }
 
     TlsServerConfiguration config = tls_server_default_configuration(6969, cert_path, private_key_path);
+    config.thread_count = 2;
     config.receive_callback.invoke = on_data;
     config.connect_callback.invoke = on_connect;
     config.disconnect_callback.invoke = on_disconnect;
@@ -242,6 +287,7 @@ int server_run(){
     tls_server_run(server);
 
     tls_server_free(server);
+    http_core_free();
 
 exit_manager:
     config_manager_free(manager);
