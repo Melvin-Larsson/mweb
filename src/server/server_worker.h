@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <netinet/in.h>
 
 typedef struct{
     ssize_t index;
@@ -15,7 +16,6 @@ typedef struct{
 typedef struct{
     const char *cert_file_path;
     const char *private_key_path;
-    int port;
 }ServerWorkerConfig;
 
 typedef enum{
@@ -32,9 +32,10 @@ typedef struct ServerWorker ServerWorker;
 ServerWorker *server_worker_new(ServerWorkerConfig config);
 ServerWorkerStatus server_worker_run(ServerWorker *worker);
 void server_worker_free(ServerWorker *worker);
+bool server_worker_add_client(ServerWorker *worker, int client_fd, struct sockaddr_storage addr);
+unsigned int server_worker_get_workload_weight(ServerWorker *worker);
 
 void server_worker_set_ssl_ctx_cb(ServerWorker *worker, bool (*callback)(void *u_data, SSL_CTX *ctx ), void *u_data);
-
 void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, void *u_client_data, const ClientHandle client, char *received, size_t size), void *u_data);
 void server_worker_set_connect_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client), void *u_data);
 void server_worker_set_disconnect_callback(ServerWorker *worker, void (*callback)(void *u_data, void * u_client_data, const ClientHandle client), void *u_data);

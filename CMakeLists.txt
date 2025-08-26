@@ -7,6 +7,7 @@ set(SERVER_SOURCES
     src/server/server.c
     src/server/server_worker.c
     src/server/config_manager.c
+    src/server/tls_server.c
 )
 
 set(HTTP2_SOURCES

@@ -76,7 +76,6 @@ void _cancel_and_free_token(CancellationToken *token){
         callback.on_cancel(callback.u_data);
     }
     slot_map_iterator_free(iterator);
-    printf("done\n");
 
     slot_map_free(token->callbacks);
     free(token);

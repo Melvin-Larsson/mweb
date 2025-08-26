@@ -14,7 +14,7 @@
 #include "http_core/http_core.h"
 #include "openssl/ssl.h"
 #include "assert.h"
-#include "server_worker.h"
+#include "tls_server.h"
 #include "config_manager.h"
 #include "http2/http2.h"
 #include "io_uring/io_uring.h"
@@ -32,8 +32,7 @@
 #include "queue_test.c"
 #endif
 
-ServerWorker *sworker;
-ThreadPool *thread_pool;
+TlsServer *server;
 typedef enum{
     Http2
 
@@ -41,7 +40,7 @@ typedef enum{
 
 typedef struct{
     ClientType type;
-    ClientHandle client;
+    TlsServerClient client;
     ThreadPoolQueue queue;
     CancellationTokenFactory *token_factory;
     CancellationToken *token;
@@ -56,27 +55,21 @@ void signal_handler(int signal){}
 
 bool send_cb(void *u_data, const uint8_t *data, size_t size){
     Client *client_data = (Client *)u_data;
-    server_worker_send(sworker, client_data->client, (char *)data, size);
+    tls_server_send(server, client_data->client, data, size);
 
     return true;
 }
 
-void _on_disconnect_work(void *data){
+void on_disconnect(void *u_data, void *u_client_data){
     LOG_DEBUG("Handle disconnect work");
-    Client *client_data = (Client *)data;
+    Client *client_data = (Client *)u_client_data;
     cancellation_token_factory_cancel_and_free(client_data->token_factory);
     http2_client_free(client_data->http2Client);
-    threadpool_release_queue(thread_pool, client_data->queue);
     free(client_data);
     LOG_INFO("Client disconnected");
 }
-void on_disconnect(void *u_data, void *u_client_data, const ClientHandle client){
-    Client *client_data = (Client *)u_client_data;
-    threadpool_enqueue_work(thread_pool, client_data->queue, _on_disconnect_work, client_data);
-    LOG_DEBUG("Client disconnect work enqued");
-}
 
-void on_connect(void *u_data, const ClientHandle client){
+void on_connect(void *u_data, const TlsServerClient client){
     Client *client_data = malloc(sizeof(Client));
     assert(client_data != NULL);
     Http2Client *http2Client = http2_client_new((Http2SendCb){.send = send_cb, .u_data = client_data});
@@ -95,9 +88,7 @@ void on_connect(void *u_data, const ClientHandle client){
         .http2Client = http2Client
     };
 
-    assert(threadpool_try_create_new_queue(thread_pool, &client_data->queue));
-
-    server_worker_attach_client_data(sworker, client, client_data);
+    tls_server_attach_client_data(server, client, client_data);
 
     LOG_INFO("Client connected");
 }
@@ -118,7 +109,6 @@ void _on_io_uring_done_work(void *args){
 
 void on_iouring_done(void *args){
     Work *work = (Work *)args;
-    threadpool_enqueue_work(thread_pool, work->client->queue, _on_io_uring_done_work, work);
 }
 
 typedef struct{
@@ -128,14 +118,17 @@ typedef struct{
 }OnDataCtx;
 
 void _on_data_work(void *arg){
-    LOG_DEBUG("Handle client data work %X\n", arg);
-    OnDataCtx *ctx = (OnDataCtx *)arg;
+}
 
-    TaskList tasks = http2_client_handle_message_async(ctx->client->http2Client, ctx->buffer, ctx->data_size, ctx->client->token);
+void on_data(void *u, void *u_client_data, uint8_t *buff, size_t len){
+    LOG_DEBUG("Handle client data work %X\n", u_client_data);
+    Client *client = (Client *)u_client_data;
+
+    TaskList tasks = http2_client_handle_message_async(client->http2Client, (char *)buff, len, client->token);
     Task task;
     while(task_list_try_dequeue(&tasks, &task)){
         Work *work = malloc(sizeof(Work));
-        work->client = ctx->client;
+        work->client = client;
         work->task = task;
         IoUringCallback cb = {
             .invoke = on_iouring_done,
@@ -146,25 +139,8 @@ void _on_data_work(void *arg){
         }
     }
 
-    free(ctx->buffer);
-    free(ctx);
     task_list_clear(&tasks);
-    LOG_INFO("Finished handling client data work %X\n", arg);
-}
-
-void on_data(void *u, void *u_client_data, const ClientHandle client, char *buff, size_t len){
-    Client *client_data = (Client *)u_client_data;
-    OnDataCtx *ctx = malloc(sizeof(OnDataCtx));
-    assert(ctx != NULL);
-    *ctx = (OnDataCtx){
-        .buffer = malloc(len),
-        .data_size = len,
-        .client = client_data
-    };
-    assert(ctx->buffer != NULL);
-    memcpy(ctx->buffer, buff, len);
-    threadpool_enqueue_work(thread_pool, client_data->queue, _on_data_work, ctx);
-    LOG_DEBUG("Enqueued client data work %X\n", ctx);
+    LOG_INFO("Finished handling client data work %X\n", u_client_data);
 }
 
 void error_handler(int signal){
@@ -209,12 +185,6 @@ int server_run(){
         return 1;
     }
 
-    thread_pool = threadpool_new();
-    if(thread_pool == NULL){
-        assert(false && "Unable to allocate threadpool");
-        return 1;
-    }
-
     int status = 0;
     ConfigManager *manager = config_manager_load_from_appconfig();
     if(manager == NULL){
@@ -254,28 +224,24 @@ int server_run(){
         goto exit_manager;
     }
 
-    ServerWorkerConfig config = {
-        .cert_file_path = cert_path,
-        .private_key_path = private_key_path,
-        .port = port
-    };
+    TlsServerConfiguration config = tls_server_default_configuration(6969, cert_path, private_key_path);
+    config.receive_callback.invoke = on_data;
+    config.connect_callback.invoke = on_connect;
+    config.disconnect_callback.invoke = on_disconnect;
+    config.ssl_ctx_callback.invoke = configure_ssl;
 
-    sworker = server_worker_new(config);
-    assert(sworker != NULL);
-    server_worker_set_receive_callback(sworker, on_data, NULL);
-    server_worker_set_connect_callback(sworker, on_connect, NULL);
-    server_worker_set_disconnect_callback(sworker, on_disconnect, NULL);
-    server_worker_set_ssl_ctx_cb(sworker, configure_ssl, NULL);
+
+    server = tls_server_new(config);
+    assert(server != NULL);
 
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
     signal(SIGPIPE, error_handler);
 
-    server_worker_run(sworker);
+    tls_server_run(server);
 
-    server_worker_free(sworker);
-    threadpool_free(thread_pool);
+    tls_server_free(server);
 
 exit_manager:
     config_manager_free(manager);

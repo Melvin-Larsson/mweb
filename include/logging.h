@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <sys/time.h>
+#include "errno.h"
 
 #ifndef LOG_CONTEXT
 #define LOG_CONTEXT __FILE__
@@ -60,9 +61,6 @@ static void log_message(FILE *file, int level, const char *format, va_list args)
 
     vfprintf(file, format, args);
     fprintf(file, "\n");
-    if(level == LOG_LEVEL_ERROR){
-        assert(0);
-    }
 }
 
 static void log_printf(FILE *file, int level, const char *format, ...) {

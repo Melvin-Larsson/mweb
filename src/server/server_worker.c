@@ -108,9 +108,9 @@ typedef struct{
 
 struct ServerWorker{
     SSL_CTX *ssl_ctx;
-    int socket;
     int stopfd;
     int epollfd;
+    int eventfd;
 
     ClientBuffer client_buffer;
 
@@ -123,9 +123,9 @@ struct ServerWorker{
     ClientQueue write_queue;
 
     ServerWorkerConfig config;
-};
 
-static int connections = 0;
+    unsigned int client_count;
+};
 
 static bool _client_buffer_initialize(ClientBuffer *buffer);
 static void _client_buffer_clear(ClientBuffer *buffer);
@@ -149,10 +149,8 @@ static bool _client_queue_resize_without_lock(ClientQueue *queue, size_t new_siz
 
 
 static SSL_CTX * _create_ssl_context(ServerWorkerConfig *config);
-static int _create_listen_socket(int port);
 static ServerWorkerStatus _listen(ServerWorker *worker);
 
-static Client * _accept_client(ServerWorker *worker);
 static void _handle_write_signal(ServerWorker *worker);
 static void _handle_client_write(ServerWorker *worker, Client *client);
 static void _handle_client_read(ServerWorker *worker, Client *client);
@@ -175,7 +173,6 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
     ServerWorkerConfig config_copy = {
         .cert_file_path = strdup(config.cert_file_path),
         .private_key_path = strdup(config.private_key_path),
-        .port = config.port
     };
 
     if(config_copy.cert_file_path == NULL || config_copy.private_key_path == NULL){
@@ -186,12 +183,12 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
 
     *worker = (ServerWorker){
         .ssl_ctx = NULL,
-        .socket = -1,
         .epollfd = -1,
         .receivedCallback = {NULL, NULL},
         .connectCallback = {NULL, NULL},
         .disconnectCallback = {NULL, NULL},
-        .config = config_copy
+        .config = config_copy,
+        .client_count = 0,
     };
 
     worker->stopfd = eventfd(0, 0);
@@ -199,8 +196,19 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
         goto exit_worker;
     }
 
-    if(!_client_buffer_initialize(&worker->client_buffer)){
+    worker->eventfd = eventfd(0, 0);
+    if(worker->eventfd == -1){
         goto exit_stop_fd;
+    }
+
+    worker->epollfd = epoll_create1(0);
+    if(worker->epollfd < 0){
+        ERRNO_ERROR("Failed creating epoll");
+        goto exit_event_fd;
+    }
+
+    if(!_client_buffer_initialize(&worker->client_buffer)){
+        goto exit_epoll_fd;
     }
 
     if(!_client_queue_initialize(&worker->write_queue)){
@@ -209,8 +217,12 @@ ServerWorker *server_worker_new(ServerWorkerConfig config){
 
     return worker;
 
+exit_epoll_fd:
+    close(worker->epollfd);
 exit_client_buffer:
     _client_buffer_clear(&worker->client_buffer);
+exit_event_fd:
+    close(worker->eventfd);
 exit_stop_fd:
     close(worker->stopfd);
 exit_worker:
@@ -264,12 +276,6 @@ void server_worker_free(ServerWorker *worker){
         worker->ssl_ctx = NULL;
     }
 
-    LOG_DEBUG("Freeing socket");
-    if(worker->socket > 0){
-        close(worker->socket);
-        worker->socket = -1;
-    }
-
     LOG_DEBUG("Freeing epoll");
     if(worker->epollfd > 0){
         close(worker->epollfd);
@@ -298,7 +304,6 @@ void server_worker_free(ServerWorker *worker){
 ServerWorkerStatus server_worker_run(ServerWorker *worker){
     assert(worker != NULL);
     assert(worker->ssl_ctx ==NULL);
-    assert(worker->socket < 0);
 
     worker->ssl_ctx = _create_ssl_context(&worker->config);
     if(worker->ssl_ctx == NULL){
@@ -307,12 +312,6 @@ ServerWorkerStatus server_worker_run(ServerWorker *worker){
     if(worker->sslCtxCallback.invoke && 
             !worker->sslCtxCallback.invoke(worker->sslCtxCallback.u_data, worker->ssl_ctx)){
         return ServerWorkerUnableToCreateSSLContext;
-    }
-
-    worker->socket = _create_listen_socket(worker->config.port);
-
-    if(worker->socket < 0){
-        return ServerWorkerPortCreationError;
     }
 
     return _listen(worker);
@@ -346,12 +345,116 @@ void server_worker_request_stop(ServerWorker *worker){
     write(worker->stopfd, &buff, sizeof(buff));
 }
 
+unsigned int server_worker_get_workload_weight(ServerWorker *worker){
+    return worker->client_count;
+}
+
+bool server_worker_add_client(ServerWorker *worker, int socket, struct sockaddr_storage addres){
+    assert(worker != NULL);
+    assert(worker->ssl_ctx != NULL);
+    assert(worker->epollfd > 0);
+    assert(worker->eventfd > 0);
+
+    LOG_INFO("Accepting client... %d", worker->client_count);
+
+    Client *client = malloc(sizeof(Client));
+    if(client == NULL){
+        ERROR("Unable to allocate client data");
+        return false;
+    }
+    *client = (Client){
+        .has_been_connected = false,
+        .ssl = NULL,
+        .socket = socket,
+        .u_client_data = NULL,
+        .address = addres
+    };
+
+    if(pthread_mutex_init(&client->write_lock, 0) != 0){
+        ERRNO_ERROR("Unable to iniitliaze client write mutex");
+        goto exit_client;
+    }
+
+    LOG_DEBUG("Initialize data buffers");
+    _data_buffer_initialize_empty(&client->in_flight_out_buffer);
+    _data_buffer_initialize_empty(&client->out_buffer);
+
+    if(!_set_nonblocking(client->socket)){
+        ERRNO_ERROR("Unable to set client socket to nonblocking.");
+        goto exit_client;
+    }
+
+    LOG_DEBUG("Create SSL");
+    client->ssl = SSL_new(worker->ssl_ctx);
+    if(client->ssl == NULL){
+        goto exit_client;
+    }
+
+    if(SSL_set_fd(client->ssl, client->socket) == 0){
+        SSL_ERROR("Unable to set fd");
+        goto exit_ssl;
+    }
+
+    if(!_client_buffer_add(&worker->client_buffer, client)){
+        ERROR("Unable to store client in buffer.");
+        goto exit_ssl;
+    }
+
+    LOG_DEBUG("Perform SSL handshake");
+    _client_set_status(worker, client, Handshake);
+    int accept_status = SSL_accept(client->ssl);
+    if(accept_status <= 0){
+        int reason = SSL_get_error(client->ssl, accept_status);
+        if(reason != SSL_ERROR_WANT_READ && reason != SSL_ERROR_WANT_WRITE){
+            SSL_ERROR("Failed when accepting ssl client");
+            goto exit_client_buffer;
+        }
+    }else{
+        client->has_been_connected = true;
+        if(worker->connectCallback.invoke){
+            worker->connectCallback.invoke(worker->connectCallback.u_data, client->handle);
+        }
+        _client_set_status(worker, client, Idle);
+        _handle_client_read(worker, client);
+    }
+
+    LOG_DEBUG("Tried performing SSL handshake, but failed");
+
+    struct epoll_event ev  = {
+        .events = EPOLLIN | EPOLLOUT | EPOLLET,
+        .data = client
+    };
+    if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, client->socket, &ev) < 0){
+        ERRNO_ERROR("Failed to epoll client");
+        goto exit_client_buffer;
+    }
+    uint64_t dummy = 1;
+    write(worker->eventfd, &dummy, sizeof(dummy));
+
+    char buff[128];
+    _ip_str((struct sockaddr *)&client->address, buff, sizeof(buff));
+    LOG_INFO("Client nr %d with ip %s connected", worker->client_count, buff);
+
+    return true;
+
+exit_client_buffer:
+    _client_buffer_remove(&worker->client_buffer, client);
+exit_ssl:
+    SSL_free(client->ssl);
+    client->ssl = NULL;
+exit_write_lock:
+    pthread_mutex_destroy(&client->write_lock);
+exit_client:
+    client->socket = -1;
+    free(client);
+    return false;
+}
+
 static ServerWorkerStatus _listen(ServerWorker *worker){
     assert(worker != NULL);
-    assert(worker->socket > 0);
     assert(worker->stopfd > 0);
     assert(worker->ssl_ctx != NULL);
-    assert(worker->epollfd < 0);
+    assert(worker->epollfd > 0);
     assert(worker->write_queue.clients != NULL);
     assert(worker->write_queue.queue_size >= WRITE_QUEUE_DEFAULT_SIZE);
     assert(worker->write_queue.enqueu_event_fd >= 0);
@@ -360,30 +463,13 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
 
     ServerWorkerStatus status = ServerWorkerStatusOk;
 
-    worker->epollfd = epoll_create1(0);
-    if(worker->epollfd < 0){
-        ERRNO_ERROR("Failed creating epoll");
-        return ServerWorkerListenError;
-    }
-
-    struct epoll_event socket_cfg = {
-        .events = EPOLLIN,
-        .data.fd = worker->socket
-    };
-    if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, worker->socket, &socket_cfg) < 0){
-        ERRNO_ERROR("Failed to listen");
-        status = ServerWorkerListenError;
-        goto exit_epoll;
-    }
-
     struct epoll_event stop_cfg = {
         .events = EPOLLIN,
         .data.fd = worker->stopfd
     };
     if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, worker->stopfd, &stop_cfg) < 0){
         ERRNO_ERROR("Failed to listen on stop signal");
-        status = ServerWorkerListenError;
-        goto exit_socket;
+        return ServerWorkerListenError;
     }
 
     struct epoll_event write_cfg = {
@@ -396,7 +482,17 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
         goto exit_stop_fd;
     }
 
-    LOG_INFO("Listening on port %d...", worker->config.port);
+    struct epoll_event event_cfg = {
+        .events = EPOLLIN,
+        .data.fd = worker->eventfd
+    };
+    if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, worker->eventfd, &event_cfg) < 0){
+        ERRNO_ERROR("Failed to listen on event signal");
+        status = ServerWorkerListenError;
+        goto exit_write_fd;
+    }
+
+    LOG_INFO("Server worker waiting for event");
 
     struct epoll_event events[16];
     while(true){
@@ -432,25 +528,11 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
                 LOG_INFO("Write signal handled");
                 continue;
             }
-            else if(event.data.fd == worker->socket){
-                LOG_INFO("Client connecting");
-                Client *client = _accept_client(worker);
-                if(client == NULL){
-                    continue; 
-                }
-                assert(client->socket > 0);
-                struct epoll_event ev  = {
-                    .events = EPOLLIN | EPOLLOUT | EPOLLET,
-                    .data = client
-                };
-                if(epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, client->socket, &ev) < 0){
-                    ERRNO_ERROR("Failed to epoll client");
-                    _disconnect_and_free_client(worker, client);
-                    continue;
-                }
-                if(client->status == Idle){
-                    _handle_client_read(worker, client);
-                }
+            else if(event.data.fd == worker->eventfd){
+                LOG_TRACE("Event signal received");
+                uint64_t buff = 0;
+                read(worker->eventfd, &buff, sizeof(buff));
+                LOG_TRACE("Event signal handled");
                 continue;
             }
             else{
@@ -479,114 +561,13 @@ static ServerWorkerStatus _listen(ServerWorker *worker){
 
 exit_clients:
     _disconnect_all_clients(worker);
+    epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->eventfd, NULL);
+exit_write_fd:
     epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->write_queue.enqueu_event_fd, NULL);
 exit_stop_fd:
     epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->stopfd, NULL);
-exit_socket:
-    epoll_ctl(worker->epollfd, EPOLL_CTL_DEL, worker->socket, NULL);
-exit_epoll:
-    close(worker->epollfd);
     worker->epollfd = -1;
     return status;
-}
-
-static Client *_accept_client(ServerWorker *worker){
-    assert(worker != NULL);
-    assert(worker->socket > 0);
-    assert(worker->ssl_ctx != NULL);
-
-    LOG_INFO("Accepting client... %d", connections);
-
-    Client *client = malloc(sizeof(Client));
-    if(client == NULL){
-        ERROR("Unable to allocate client data");
-        return NULL;
-    }
-    *client = (Client){
-        .has_been_connected = false,
-        .ssl = NULL,
-        .socket = -1,
-        .u_client_data = NULL,
-    };
-
-    if(pthread_mutex_init(&client->write_lock, 0) != 0){
-        ERRNO_ERROR("Unable to iniitliaze client write mutex");
-        goto exit_client;
-    }
-
-    LOG_DEBUG("Initialize data buffers");
-    _data_buffer_initialize_empty(&client->in_flight_out_buffer);
-    _data_buffer_initialize_empty(&client->out_buffer);
-    socklen_t addrlen = sizeof(client->address);
-
-    client->socket = accept(worker->socket, (struct sockaddr *)&client->address, &addrlen);
-    if(client->socket < 0){
-        ERRNO_ERROR("Accept error");
-        goto exit_write_lock;
-    }
-    LOG_DEBUG("Accept client %d", connections);
-    connections++;
-
-
-    if(!_set_nonblocking(client->socket)){
-        ERRNO_ERROR("Unable to set client socket to nonblocking. Disconnecting client");
-        goto exit_error_socket;
-    }
-
-    LOG_DEBUG("Create SSL");
-    client->ssl = SSL_new(worker->ssl_ctx);
-    if(client->ssl == NULL){
-        goto exit_error_socket;
-    }
-
-    if(SSL_set_fd(client->ssl, client->socket) == 0){
-        SSL_ERROR("Unable to set fd");
-        goto exit_ssl;
-    }
-
-    if(!_client_buffer_add(&worker->client_buffer, client)){
-        ERROR("Unable to store client in buffer. Disconnecting client");
-        goto exit_ssl;
-    }
-
-    LOG_DEBUG("Perform SSL handshake");
-    _client_set_status(worker, client, Handshake);
-    int accept_status = SSL_accept(client->ssl);
-    if(accept_status <= 0){
-        int reason = SSL_get_error(client->ssl, accept_status);
-        if(reason != SSL_ERROR_WANT_READ && reason != SSL_ERROR_WANT_WRITE){
-            SSL_ERROR("Failed when accepting ssl client");
-            goto exit_client_buffer;
-        }
-    }else{
-        client->has_been_connected = true;
-        if(worker->connectCallback.invoke){
-            worker->connectCallback.invoke(worker->connectCallback.u_data, client->handle);
-        }
-        _client_set_status(worker, client, Idle);
-    }
-
-    LOG_DEBUG("Tried performing SSL handshake, but failed");
-
-    char buff[128];
-    _ip_str((struct sockaddr *)&client->address, buff, sizeof(buff));
-    LOG_INFO("Client with ip %s connected", buff);
-
-    return client;
-
-exit_client_buffer:
-    _client_buffer_remove(&worker->client_buffer, client);
-exit_ssl:
-    SSL_free(client->ssl);
-    client->ssl = NULL;
-exit_error_socket:
-    close(client->socket);
-    client->socket = -1;
-exit_write_lock:
-    pthread_mutex_destroy(&client->write_lock);
-exit_client:
-    free(client);
-    return NULL;
 }
 
 static void _handle_write_signal(ServerWorker *worker){
@@ -606,7 +587,6 @@ static void _handle_write_signal(ServerWorker *worker){
             Client *client = _client_buffer_get_client(worker, handle);
             if(client == NULL){
                 LOG_WARNING("Write buffer contains disconnected client, ignoring...");
-                ERROR("Penis");
             }
             else{
                 if(client->status & Idle){
@@ -684,6 +664,8 @@ static void _handle_client_handshake(ServerWorker *worker, Client *client){
         SSL_ERROR("Failed when accepting ssl client. Disconnecting");
         _disconnect_and_free_client(worker, client);
     }
+
+    LOG_TRACE("Handshake not done");
 }
 
 static void _handle_client_read(ServerWorker *worker, Client *client){
@@ -795,9 +777,6 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
         ERRNO_ERROR("Unable to remove client for polling");
     }       
 
-    int status = SSL_shutdown(client->ssl);
-    assert(status == 1);
-
     int close_stuats = close(client->socket);
     if(close_stuats != 0){
         ERRNO_ERROR("Unable to close socket");
@@ -819,8 +798,8 @@ static void _disconnect_and_free_client(ServerWorker *worker, Client *client){
     };
 
     free(client);
-    connections--;
-    LOG_DEBUG("Client freed and disconnected, I have %d clients left", connections);
+    worker->client_count--;
+    LOG_DEBUG("Client freed and disconnected, I have %d clients left", worker->client_count);
 }
 
 static void _client_set_status(ServerWorker *worker, Client *client, ClientStatus status){
@@ -892,43 +871,6 @@ static SSL_CTX * _create_ssl_context(ServerWorkerConfig *config){
 error:
     SSL_CTX_free(ctx);
     return NULL;
-}
-
-static int _create_listen_socket(int port){
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if(sockfd < 0){
-        perror("Socket fail");
-        exit(EXIT_FAILURE);
-    }
-
-    int opt = 1;
-    if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0){
-        ERRNO_ERROR("Failed to set socket options");
-        return -1;
-    }
-
-    if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0){
-        ERRNO_ERROR("Failed to set socket options");
-        return -1;
-    }
-
-    struct sockaddr_in address;
-    socklen_t addrlen = sizeof(address);
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    address.sin_addr.s_addr = INADDR_ANY;
-
-    if(bind(sockfd, (struct sockaddr *)&address, addrlen) < 0){
-        ERRNO_ERROR("Bind failed");
-        return -1;
-    }
-
-    if(listen(sockfd, 128) < 0){
-        ERRNO_ERROR("Listen");
-        return -1;
-    }
-
-    return sockfd;
 }
 
 static int _ip_str(struct sockaddr *sockaddr, char *result, size_t buffer_size){
