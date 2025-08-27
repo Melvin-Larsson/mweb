@@ -45,6 +45,7 @@ TlsServerConfiguration tls_server_default_configuration(int port, const char *ce
 TlsServer *tls_server_new(TlsServerConfiguration configuration);
 void tls_server_free(TlsServer *server);
 void tls_server_run(TlsServer *server);
+void tls_server_request_stop(TlsServer *server);
 
 ServerStatus tls_server_send(TlsServer *server, const TlsServerClient client, const uint8_t *buffer, size_t buffer_size);
 ServerStatus tls_server_attach_client_data(TlsServer *server, const TlsServerClient client, void *u_client_data);

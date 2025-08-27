@@ -46,6 +46,13 @@ typedef struct{
     size_t content_count;
 }HttpCore;
 
+struct ResponseHandle{
+    int fd;
+    off_t offset;
+    off_t file_size;
+    Buffer buffer;
+};
+
 static bool _load_content(HttpCore *core, const char *root, const char *path);
 static void _print_index(Index *index);
 
@@ -103,17 +110,19 @@ static off_t _file_size(const char *path) {
     return st.st_size;
 }
 
-void _on_file_read(void *arg){
+TaskList _on_file_read(void *arg){
     LOG_INFO("File read, handling response");
     ResponseCtx *ctx = (ResponseCtx *)arg;
     cancellation_token_remove_callback(ctx->token, ctx->handle);
-    ctx->callback.invoke(ctx->callback.u_data, &ctx->result);
+    TaskList tasks = ctx->callback.invoke(ctx->callback.u_data, &ctx->result);
 
     free(ctx->result.body);
     free(ctx->header_buffer.data);
     close(ctx->fd);
     free(ctx);
     LOG_DEBUG("Response handled");
+
+    return tasks;
 }
 
 static void _free_response_ctx(void *arg){
@@ -122,45 +131,30 @@ static void _free_response_ctx(void *arg){
     free(ctx);
 }
 
-Task http_core_create_response_async(const HttpRequest *request, ResponseCallback callback, CancellationToken *token){
-    if(callback.invoke == NULL){
-        assert(false && "No callback function specified");
-        return completed_task();
-    }
-
-    LOG_TRACE("Creating response for %.*s", request->path_length, request->path);
-
-    ContentHandle handle;
-    if(!_index_try_get_content_handle(&core.index, request->path, request->path_length, &handle)){
-        LOG_DEBUG("404 file '%.*s' not found", request->path_length, request->path);
-        HttpResponse response = http_response_empty(HttpStatus404);
-        callback.invoke(callback.u_data, &response);
-        return completed_task();
+static HttpResponse _create_initialize_resonse(const HttpRequest *request, ContentHandle *handle, Buffer *buffer){
+    LOG_DEBUG("Creating response for path %.*s", request->path_length, request->path);
+    if(!_index_try_get_content_handle(&core.index, request->path, request->path_length, handle)){
+        return http_response_empty(HttpStatus404);
     }
 
     LOG_TRACE("Content found");
+    *buffer = (Buffer){
+        .data = NULL
+    };
 
-    int fd = open(handle.full_path, O_RDONLY);
-    if(fd <= 0){
-        ERRNO_ERROR("Unable to open file");
-        HttpResponse response = http_response_empty(HttpStatus404);
-        callback.invoke(callback.u_data, &response);
-        return completed_task();
-    }
-
-    off_t file_size = _file_size(handle.full_path);
+    ssize_t file_size = _file_size(handle->full_path);
     if(file_size < 0){
-        return completed_task();
+        return http_response_empty(HttpStatus404);
     }
 
     LOG_TRACE("Creating response headers");
     HttpHeaderField fields[2];
     char buff[32];
     size_t count = 0;
-    if(handle.type == M3U8){
+    if(handle->type == M3U8){
         fields[count++] = http_header_field_from_str("content-type", "application/vnd.apple.mpegurl");
     }
-    else if(handle.type == TS){
+    else if(handle->type == TS){
         fields[count++] = http_header_field_from_str("content-type", "video/mp2t");
         snprintf(buff, sizeof(buff), "%zu", file_size);
         fields[count++] = http_header_field_from_str("content-length", buff);
@@ -170,32 +164,57 @@ Task http_core_create_response_async(const HttpRequest *request, ResponseCallbac
     uint8_t *header_data = malloc(header_data_size);
     if(header_data == NULL){
         ERROR("Unable to allocate header buffer");
-        return completed_task();
+        return http_response_empty(HttpStatus404);
     }
 
-    Buffer header_buffer;
-    buffers_init_buffer(&header_buffer, header_data, header_data_size);
+    buffers_init_buffer(buffer, header_data, header_data_size);
     HttpResponse response = http_response_empty(HttpStatus200);
     LOG_TRACE("Moving header fields to buffer");
-    response.headers = http_header_fields_to_buffer(fields, count, &header_buffer);
-    assert(header_buffer.used_size < header_buffer.total_size);
+    response.headers = http_header_fields_to_buffer(fields, count, buffer);
+    assert(buffer->used_size < buffer->total_size);
     LOG_TRACE("Moved header fields to buffer");
 
     response.header_count = count;
     response.body_size = file_size;
-    response.body = malloc(file_size);
+    response.body = NULL;
 
-    if(response.body == NULL){
-        ERROR("Unable to allocate response body");
-        free(header_data);
+    return response;
+}
+
+Task http_core_create_response_async(const HttpRequest *request, ResponseCallback callback, CancellationToken *token){
+    if(callback.invoke == NULL){
+        assert(false && "No callback function specified");
         return completed_task();
+    }
+
+    LOG_TRACE("Creating response for %.*s", request->path_length, request->path);
+    ContentHandle handle;
+    Buffer buffer = {0};
+    HttpResponse response = _create_initialize_resonse(request, &handle, &buffer);
+    if(response.status != HttpStatus200){
+        callback.invoke(callback.u_data, &response);
+        free(buffer.data);
+    }
+
+    ssize_t file_size = _file_size(handle.full_path);
+    if(file_size < 0){
+        callback.invoke(callback.u_data, &response);
+        free(buffer.data);
+    }
+
+    int fd = open(handle.full_path, O_RDONLY);
+    if(fd <= 0){
+        ERRNO_ERROR("Failed to open file");
+        callback.invoke(callback.u_data, &response);
+        free(buffer.data);
     }
 
     ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
     if(ctx == NULL){
         ERROR("Unable to allocate response ctx");
+        close(fd);
         free(response.body);
-        free(header_data);
+        free(buffer.data);
         return completed_task();
     }
     *ctx = (ResponseCtx){
@@ -203,7 +222,7 @@ Task http_core_create_response_async(const HttpRequest *request, ResponseCallbac
         .fd = fd,
         .result = response,
         .token = token,
-        .header_buffer = header_buffer
+        .header_buffer = buffer
     };
 
     LOG_DEBUG("Enqueing work to load %.*s", (int)request->path_length, request->path);
@@ -212,8 +231,135 @@ Task http_core_create_response_async(const HttpRequest *request, ResponseCallbac
         .u_data = ctx
     };
     cancellation_token_add_callback(token, cb, &ctx->handle);
-    IoUringOp op = io_uring_read_op(fd, ctx->result.body, file_size);
+    IoUringOp op = io_uring_read_op(fd, ctx->result.body, file_size, 0);
     return io_uring_task(_on_file_read, ctx, op);
+}
+
+ResponseHandle *http_core_new_partial_response(const HttpRequest *request, HttpResponse *initial_response){
+    ContentHandle handle;
+    Buffer buffer = {0};
+    *initial_response = _create_initialize_resonse(request, &handle, &buffer);
+
+    if(initial_response->status != HttpStatus200){
+        ResponseHandle *response_handle = malloc(sizeof(ResponseHandle));
+        if(response_handle == NULL){
+            return NULL;
+        }
+        *response_handle = (ResponseHandle){
+            .buffer = buffer,
+            .fd = 0,
+            .file_size = 0,
+            .offset = 0
+        };
+        return response_handle;
+    }
+
+
+    off_t size = _file_size(handle.full_path);
+    if(size < 0){
+        ERRNO_ERROR("Unable to read file size");
+        return NULL;
+    }
+
+    int fd = open(handle.full_path, O_RDONLY);
+    if(fd <= 0){
+        ERRNO_ERROR("Unable to open file");
+        return NULL;
+    }
+
+    ResponseHandle *response_handle = malloc(sizeof(ResponseHandle));
+    if(response_handle == NULL){
+        return NULL;
+    }
+    *response_handle = (ResponseHandle){
+        .buffer = buffer,
+        .fd = fd,
+        .offset = 0,
+        .file_size = size
+    };
+    return response_handle;
+}
+
+typedef struct{
+    ResponseHandle *response_handle;
+    BodyResponseCallback callback;
+    CancellationToken *token;
+    CancellationTokenCallbackHandle cancel_handle;
+    uint8_t *data;
+    size_t length;
+}PartialResponseCtx;
+
+void _free_partial_response_ctx(void *args){
+    free(args);
+}
+
+TaskList _on_partial_read(void *args){
+    PartialResponseCtx *ctx = (PartialResponseCtx *)args;
+    TaskList result = ctx->callback.invoke(ctx->callback.u_data, true, ctx->data, ctx->length);
+
+    cancellation_token_remove_callback(ctx->token, ctx->cancel_handle);
+    free(ctx->data);
+    free(ctx);
+    return result;
+}
+
+Task http_core_advance_partial_response_async(ResponseHandle *handle, size_t size, BodyResponseCallback callback, CancellationToken *token){
+    assert(callback.invoke != NULL);
+
+    if(!http_core_partial_response_has_more(handle)){
+        callback.invoke(callback.u_data, false, NULL, 0);
+        return completed_task();
+    }
+
+    PartialResponseCtx *ctx = malloc(sizeof(PartialResponseCtx));
+    size_t read_size = min(size, handle->file_size - handle->offset);
+    uint8_t *buffer = malloc(read_size);
+    if(ctx == NULL || buffer == NULL){
+        free(ctx);
+        free(buffer);
+        ERROR("Unable to allocate response ctx");
+        callback.invoke(callback.u_data, false, NULL, 0);
+        return completed_task();
+    }
+    *ctx = (PartialResponseCtx){
+        .response_handle = handle,
+        .callback = callback,
+        .token = token,
+        .data = buffer,
+        .length = read_size
+    };
+
+    CancellationTokenCallback cb = {
+        .on_cancel = _free_partial_response_ctx,
+        .u_data = ctx
+    };
+    cancellation_token_add_callback(token, cb, &ctx->cancel_handle);
+    LOG_TRACE("Reading of size %d at offset %d", read_size, handle->offset);
+    IoUringOp op = io_uring_read_op(handle->fd, buffer, read_size, handle->offset);
+    handle->offset += read_size;
+    return io_uring_task(_on_partial_read, ctx, op);
+}
+
+bool http_core_partial_response_has_more(ResponseHandle *handle){
+    return handle->offset < handle->file_size;
+}
+
+void http_core_partial_response_free(ResponseHandle *handle){
+    if(handle == NULL){
+        return;
+    }
+
+    free(handle->buffer.data);
+
+    if(handle->fd > 0){
+        close(handle->fd);
+        handle->fd = -1;
+    }
+
+    handle->file_size = 0;
+    handle->offset = 0;
+
+    free(handle);
 }
 
 static bool _load_content(HttpCore *core, const char *root, const char *path){

@@ -9,8 +9,8 @@
 #include <netinet/in.h>
 
 typedef struct{
-    ssize_t index;
-    uint64_t generation;
+    uint32_t index;
+    uint32_t generation;
 }ClientHandle;
 
 typedef struct{
@@ -32,19 +32,20 @@ typedef struct ServerWorker ServerWorker;
 ServerWorker *server_worker_new(ServerWorkerConfig config);
 ServerWorkerStatus server_worker_run(ServerWorker *worker);
 void server_worker_free(ServerWorker *worker);
+
+//Run from any thread
 bool server_worker_add_client(ServerWorker *worker, int client_fd, struct sockaddr_storage addr);
 unsigned int server_worker_get_workload_weight(ServerWorker *worker);
-
 void server_worker_set_ssl_ctx_cb(ServerWorker *worker, bool (*callback)(void *u_data, SSL_CTX *ctx ), void *u_data);
 void server_worker_set_receive_callback(ServerWorker *worker, void (*callback)(void *u_data, void *u_client_data, const ClientHandle client, char *received, size_t size), void *u_data);
 void server_worker_set_connect_callback(ServerWorker *worker, void (*callback)(void *u_data, const ClientHandle client), void *u_data);
 void server_worker_set_disconnect_callback(ServerWorker *worker, void (*callback)(void *u_data, void * u_client_data, const ClientHandle client), void *u_data);
-
-ServerWorkerStatus server_worker_attach_client_data(ServerWorker *worker, const ClientHandle client, void *u_client_data);
-
-ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle client, const char *buffer, size_t buffer_size);
 ServerWorkerStatus server_worker_enqueue_client_work(ServerWorker *worker, ClientHandle client, void (*work)(void *u_data), void *u_data);
-
 void server_worker_request_stop(ServerWorker *worker);
+
+//Must run from worker thread
+ServerWorkerStatus server_worker_attach_client_data(ServerWorker *worker, const ClientHandle client, void *u_client_data);
+ServerWorkerStatus server_worker_send(ServerWorker *worker, ClientHandle client, const char *buffer, size_t buffer_size);
+
 
 #endif

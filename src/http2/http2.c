@@ -34,6 +34,8 @@ Http2Client *http2_client_new(Http2SendCb send_cb){
         .streams = {0},
         .window_size = DEFAULT_WINDOW_SIZE,
         .send_cb = send_cb,
+        .initial_window_size = DEFAULT_WINDOW_SIZE,
+        .max_frame_size = DEFAULT_MAX_FRAME_SIZE,
     };
 
     if(client->decoder == NULL || client->encoder == NULL){
@@ -53,6 +55,10 @@ void http2_client_free(Http2Client *client){
 
     hpack_decoder_free(client->decoder);
     hpack_encoder_free(client->encoder);
+    for(size_t i = 0; i < MAX_STREAMS_PER_CLIENT; i++){
+        http_core_partial_response_free(client->streams[i].response_handle);
+        client->streams[i].response_handle = NULL;
+    }
     free(client);
 }
 
@@ -60,10 +66,17 @@ Http2InternalStatus _connection_preface_message(Http2Client *client, ParseBuffer
     char *connect_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
     size_t size_left = buffer->total_size - buffer->parsed_size;
-    if(size_left >= strlen(connect_string) && strncmp((char *)&buffer->data[buffer->parsed_size], connect_string, strlen(connect_string)) == 0){
+    uint8_t *data = &buffer->data[buffer->parsed_size];
+    if(size_left >= strlen(connect_string) && strncmp((char *)data, connect_string, strlen(connect_string)) == 0){
         buffer->parsed_size += strlen(connect_string);
         return Ok;
     }    
+    else if(size_left > 5){
+        ERROR("Invalid preface %X %X %X %X %X", data[0], data[1], data[2], data[3], data[4]);
+    }
+    else{
+        ERROR("Invalid preface, too short with length %d", size_left);
+    }
 
     return InvaidConnectionPreface;
 }
@@ -102,7 +115,7 @@ TaskList http2_client_handle_message_async(Http2Client *client, const char *buff
         Http2InternalStatus status = _connection_preface_message(client, &parse_buffer);
         if(status != Ok){
             ERROR("Connection preface failed\n");
-            exit(EXIT_FAILURE);
+            http2_common_send_goaway(client, ErrorCodeProtocolError);
         }
         client->status = Running;
         LOG_INFO("Connection preface done with %zu bytes left\n", parse_buffer.total_size - parse_buffer.parsed_size);
@@ -149,7 +162,7 @@ TaskList http2_client_handle_message_async(Http2Client *client, const char *buff
                         *stream = (Stream){
                             .id = header.stream_id,
                             .state = Idle,
-                            .window_size = DEFAULT_WINDOW_SIZE
+                            .window_size = client->initial_window_size
                         };
                         client->highest_client_stream_id = header.stream_id;
                         break;

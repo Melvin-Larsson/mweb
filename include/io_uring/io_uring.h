@@ -21,19 +21,22 @@ typedef struct{
     int op;
     void *buff;
     size_t length;
+    size_t offset;
 }IoUringOp;
 
 typedef struct IoUring IoUring;
 
 IoUring *io_uring_new();
+void io_uring_request_stop(IoUring *uring);
 bool io_uring_submit(IoUring *uring, IoUringOp op, IoUringCallback cb);
 
-static inline IoUringOp io_uring_read_op(int fd, void *buff, size_t length){
+static inline IoUringOp io_uring_read_op(int fd, void *buff, size_t length, size_t offset){
     return (IoUringOp){
         .fd = fd,
         .op = IORING_OP_READ,
         .buff = buff,
         .length = length,
+        .offset = offset
     };
 }
 

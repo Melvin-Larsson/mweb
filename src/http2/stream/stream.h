@@ -4,6 +4,7 @@
 #include "buffers.h"
 #include "http2/http2.h"
 #include "http2_frame.h"
+#include "http_core/http_core.h"
 #include <stddef.h>
 
 typedef enum{
@@ -20,6 +21,8 @@ typedef struct{
     size_t id;
     StreamState state;
     size_t window_size;
+    ResponseHandle *response_handle;
+    bool waiting_for_send_window;
 }Stream;
 
 Task idle_stream_handle_message_async(Http2Client *client, Stream *stream, const GenericFrame *frame, CancellationToken *token);

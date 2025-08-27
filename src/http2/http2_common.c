@@ -5,6 +5,9 @@
 #define LOG_CONTEXT "Http2"
 #include "logging.h"
 
+static void _send_response_headers(Http2Client *client, Stream *stream, HttpResponse *response);
+static void _free_response_ctx(void *args);
+
 bool http2_common_send(Http2Client *client, uint8_t *data, size_t size){
     return client->send_cb.send(client->send_cb.u_data, data, size);
 }
@@ -25,64 +28,139 @@ typedef struct{
     CancellationTokenCallbackHandle handle;
 }ResponseCtx;
 
-static void _on_response_created(void *u_data, HttpResponse *response){
+static TaskList _on_body_async(void *u_data, bool success, uint8_t *data, size_t size){
     ResponseCtx *ctx = (ResponseCtx *)u_data;
     Http2Client *client = ctx->client;
     Stream *stream = ctx->stream;
 
     cancellation_token_remove_callback(ctx->token, ctx->handle);
 
-    LOG_INFO("Created response:\n%.*s", (int)response->body_size, (char *)response->body);
-    LOG_INFO("With header fields");
-    http_header_fields_print(response->headers, response->header_count);
-
-    uint8_t buffer_data[4096];
-    Buffer buffer;
-    buffers_init_buffer(&buffer, buffer_data, sizeof(buffer_data));
-
-    uint8_t *response_headers = buffer_get_append_ptr(&buffer);
-    HttpHeaderField status_header_field = http_status_header_field(response->status);
-    size_t header_size = hpack_encode_headers(client->encoder, &status_header_field, 1, &buffer, IndexTypeIncremental);
-    header_size += hpack_encode_headers(client->encoder, response->headers, response->header_count, &buffer, IndexTypeIncremental);
-    assert(!buffer_size_is_full(&buffer));
-
-    InternalHeaderFrame header_frame = http2_frame_create_header_frame(response_headers, header_size, stream->id, true);
-    if(response->body_size == 0){
-        header_frame.header.flags |= END_STREAM;
-        LOG_TRACE("Last frame");
+    if(!success){
+        LOG_WARNING("Failed to ready body");
+        http2_common_send_goaway(client, ErrorCodeNoError);
+        http_core_partial_response_free(stream->response_handle);
+        stream->response_handle = NULL;
+        free(ctx);
+        return task_list_empty();
     }
 
-    uint8_t *frame_ptr = buffer_get_append_ptr(&buffer);
-    size_t headers_size = http2_frame_serialize_header_frame((char *)frame_ptr, buffer_size_left(&buffer), &header_frame);
-    http2_common_send(client, frame_ptr, headers_size);
+    if(size == 0){
+        LOG_WARNING("Empty body received when creating resposne body");
+        http_core_partial_response_free(stream->response_handle);
+        stream->response_handle = NULL;
+        free(ctx);
+        return task_list_empty();
+    }
 
-    size_t size_left = response->body_size;
-    uint8_t *data_ptr = response->body;
-    while(size_left > 0){
-        LOG_TRACE("Sending data frame, %d bytes left", size_left);
-        size_t send_size = min(size_left, 4096);
-        uint8_t buffer[4196];
-        InternalDataFrame frame = http2_frame_create_data_frame(data_ptr, send_size, stream->id);
-        if(size_left == send_size){
+    stream->window_size -= size;
+    client->window_size -= size;
+
+    bool is_last = !http_core_partial_response_has_more(stream->response_handle);
+
+    TaskList result = task_list_empty();
+    LOG_TRACE("Sending data frame of size %d", size);
+    if(is_last){
+        LOG_DEBUG("No more body data to read");
+        http_core_partial_response_free(stream->response_handle);
+        stream->response_handle = NULL;
+        LOG_TRACE("Last frame");
+        free(ctx);
+        stream->state = Closed;
+    }
+    else{
+        BodyResponseCallback callback = {
+            .invoke = _on_body_async,
+            .u_data = ctx,
+        };
+        size_t read_size = min(stream->window_size, client->window_size);
+        if(read_size == 0){
+            LOG_DEBUG("More body data to read, but send window has closed (stream: %d, connection %d)", stream->window_size, client->window_size);
+            stream->waiting_for_send_window = true;
+            free(ctx);
+        }
+        else{
+            LOG_DEBUG("More body data to read, will read of size %d", read_size);
+
+            CancellationTokenCallback cb = {
+                .on_cancel = _free_response_ctx,
+                .u_data = ctx
+            };
+            cancellation_token_add_callback(ctx->token, cb, &ctx->handle);
+            Task task = http_core_advance_partial_response_async(stream->response_handle, read_size, callback, ctx->token);
+            task_list_add_task(&result, task);
+        }
+    }
+
+    //FIXME: We shouldn't allocate new buffer here
+    size_t payload_size = min(size, client->max_frame_size);
+    size_t buffer_size = payload_size + 1024;
+    uint8_t *buffer = malloc(buffer_size);
+    assert(buffer);
+    while(size > 0){
+        payload_size = min(size, client->max_frame_size);
+
+        InternalDataFrame frame = http2_frame_create_data_frame(data, payload_size, stream->id);
+        LOG_TRACE("Created frame for size %d/%d", payload_size, size);
+
+        if(size == payload_size && is_last){
             frame.header.flags |= END_STREAM;
-            LOG_TRACE("Last frame");
+            LOG_DEBUG("Setting end stream flag");
         }
 
-        size_t frame_size = http2_frame_serialize_data_frame((char *)buffer, sizeof(buffer), &frame);
+        size_t frame_size = http2_frame_serialize_data_frame((char *)buffer, buffer_size, &frame);
+        assert(frame_size != buffer_size);
+
         http2_common_send(client, buffer, frame_size);
 
-        data_ptr += send_size;
-        size_left -= send_size;
+        data += payload_size;
+        size -= payload_size;
     }
 
-    stream->state = Closed;
+    free(buffer);
 
+    return result;
+}
+
+static void _free_response_ctx(void *args){
+    ResponseCtx *ctx = (ResponseCtx *)args;
+    http_core_partial_response_free(ctx->stream->response_handle);
+    ctx->stream->response_handle = NULL;
     free(ctx);
 }
 
-static void _free_response_ctx(void *ctx){
-    free(ctx);
+Task http2_common_advance_body(Http2Client *client, Stream *stream, CancellationToken *token){
+    size_t read_size = min(stream->window_size, client->window_size);
+    if(read_size == 0){
+        LOG_TRACE("Unable to advance body, window is not open");
+        return completed_task();
+    }
+    if(!stream->waiting_for_send_window){
+        LOG_TRACE("Unable to advance body, stream is not waiting for send window");
+        return completed_task();
+    }
+    ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
+    *ctx = (ResponseCtx){
+        .client = client,
+        .stream = stream,
+        .token = token,
+    };
+    BodyResponseCallback callback = {
+        .invoke = _on_body_async,
+        .u_data = ctx,
+    };
+
+    LOG_DEBUG("Asking for resposne %X", ctx);
+    CancellationTokenCallback cb = {
+        .on_cancel = _free_response_ctx,
+        .u_data = ctx
+    };
+    cancellation_token_add_callback(token, cb, &ctx->handle);
+
+    LOG_TRACE("Advance partial read with %d bytes", read_size);
+    stream->waiting_for_send_window = false;
+    return http_core_advance_partial_response_async(stream->response_handle, read_size, callback, token);
 }
+
 
 Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, InternalHeaderFrame frame, CancellationToken *token){
     uint8_t data[4096];
@@ -163,10 +241,22 @@ Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, Inte
         .body_size = 0,
     };
 
-    uint8_t response_data[4096];
-    Buffer response_buffer;
-    buffers_init_buffer(&response_buffer, response_data, sizeof(response_data));
-    HttpResponse http_response;
+    HttpResponse response;
+    ResponseHandle *response_handle = http_core_new_partial_response(&request, &response);
+    if(response_handle == NULL){
+        http2_common_send_goaway(client, ErrorCodeNoError);
+        return completed_task();
+    }
+    _send_response_headers(client, stream, &response);
+
+    if(!http_core_partial_response_has_more(response_handle)){
+        LOG_DEBUG("Response was completed on first request");
+        http_core_partial_response_free(response_handle);
+        stream->state = Closed;
+        return completed_task();
+    }
+
+    stream->response_handle = response_handle;
 
     ResponseCtx *ctx = malloc(sizeof(ResponseCtx));
     *ctx = (ResponseCtx){
@@ -174,8 +264,8 @@ Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, Inte
         .stream = stream,
         .token = token,
     };
-    ResponseCallback callback = {
-        .invoke = _on_response_created,
+    BodyResponseCallback callback = {
+        .invoke = _on_body_async,
         .u_data = ctx,
     };
 
@@ -185,6 +275,35 @@ Task http2_common_handle_headers_async(Http2Client *client, Stream *stream, Inte
         .u_data = ctx
     };
     cancellation_token_add_callback(token, cb, &ctx->handle);
-    return http_core_create_response_async(&request, callback, token);
+
+    size_t read_size = min(stream->window_size, client->window_size);
+    LOG_TRACE("Advance partial read with %d bytes (stream: %d, client %d)", read_size, stream->window_size, client->window_size);
+    return http_core_advance_partial_response_async(response_handle, read_size, callback, token);
 }
 
+static void _send_response_headers(Http2Client *client, Stream *stream, HttpResponse *response){
+#if LOG_LEVEL <= LOG_LEVEL_DEBUG
+    http_header_fields_print(response->headers, response->header_count);
+#endif
+
+    uint8_t buffer_data[4096];
+    Buffer buffer;
+    buffers_init_buffer(&buffer, buffer_data, sizeof(buffer_data));
+
+    uint8_t *response_headers = buffer_get_append_ptr(&buffer);
+    HttpHeaderField status_header_field = http_status_header_field(response->status);
+    size_t header_size = hpack_encode_headers(client->encoder, &status_header_field, 1, &buffer, IndexTypeIncremental);
+    header_size += hpack_encode_headers(client->encoder, response->headers, response->header_count, &buffer, IndexTypeIncremental);
+    assert(!buffer_size_is_full(&buffer));
+
+    InternalHeaderFrame header_frame = http2_frame_create_header_frame(response_headers, header_size, stream->id, true);
+    if(response->body_size == 0){
+        header_frame.header.flags |= END_STREAM;
+        LOG_TRACE("Last frame");
+    }
+
+    uint8_t *frame_ptr = buffer_get_append_ptr(&buffer);
+    size_t headers_size = http2_frame_serialize_header_frame((char *)frame_ptr, buffer_size_left(&buffer), &header_frame);
+
+    http2_common_send(client, frame_ptr, headers_size);
+}

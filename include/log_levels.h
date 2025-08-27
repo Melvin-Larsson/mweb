@@ -8,6 +8,6 @@
 #define LOG_LEVEL_ERROR 4
 #define LOG_LEVEL_NONE 5
 
-#define LOG_LEVEL LOG_LEVEL_DEBUG
+#define LOG_LEVEL LOG_LEVEL_TRACE
 
 #endif

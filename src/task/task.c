@@ -6,6 +6,8 @@
 #define DEFAULT_EXTENDED_TASK_LIST_SIZE TASK_LIST_STACK_TASK_COUNT
 #define TASK_LIST_GROWTH_FACTOR 1.5
 
+static Task _get_task(TaskList *list, size_t index);
+
 void task_list_init(TaskList *task_list){
     *task_list = (TaskList){
         .task_count = 0,
@@ -34,12 +36,8 @@ bool task_list_try_dequeue(TaskList *task_list, Task *result){
     if(task_list->_dequeue >= task_list->task_count){
         return false;
     }
-    if(task_list->_dequeue < TASK_LIST_STACK_TASK_COUNT){
-        *result = task_list->_tasks[task_list->_dequeue++];
-        return true;
-    }
-    size_t index = task_list->_dequeue++ - TASK_LIST_STACK_TASK_COUNT;
-    *result = task_list->_extended_tasks[index];
+    *result = _get_task(task_list, task_list->_dequeue);
+    task_list->_dequeue++;
 
     return true;
 }
@@ -77,3 +75,25 @@ bool task_list_add_task(TaskList *task_list, Task task){
 
     return true;
 }
+
+bool task_list_add_list(TaskList *dst, TaskList *src){
+    for(size_t i = 0; i < src->task_count; i++){
+        Task task = _get_task(src, i);
+        if(!task_list_add_task(dst, task)){
+            return false;
+        }
+    }
+    return true;
+}
+
+static Task _get_task(TaskList *list, size_t index){
+    if(index >= list->task_count){
+        assert(false && "Index out of bounds");
+        abort();
+    }
+    if(index < TASK_LIST_STACK_TASK_COUNT){
+        return list->_tasks[index];
+    }
+    index -= TASK_LIST_STACK_TASK_COUNT;
+    return list->_extended_tasks[index];
+} 

@@ -51,7 +51,16 @@ typedef struct{
 
 static IoUring *uring;
 
-void signal_handler(int signal){}
+void signal_handler(int signal){
+    if(signal == SIGTERM || signal == SIGINT){
+        tls_server_request_stop(server);
+        io_uring_request_stop(uring);
+    }
+    else{
+        ERROR("Unknown signal %d", signal);
+    }
+}
+static void _enqueue_tasks(Client *client, TaskList *tasks);
 
 bool send_cb(void *u_data, const uint8_t *data, size_t size){
     Client *client_data = (Client *)u_data;
@@ -102,12 +111,15 @@ typedef struct{
     CancellationTokenCallbackHandle cch;
 }Work;
 
+
 void _on_io_uring_done_work(void *args){
     Work *work = (Work *)args;
     LOG_DEBUG("Uring done");
 
     UringTask uring_task = work->task.uring_task;
-    uring_task.callback(uring_task.ctx);
+    TaskList tasks = uring_task.callback(uring_task.ctx);
+    LOG_TRACE("Handling of io_uring event created %d new tasks", tasks.task_count);
+    _enqueue_tasks(work->client, &tasks);
 
     cancellation_token_remove_callback(work->client->token, work->cch);
     pthread_mutex_destroy(&work->lock);
@@ -161,8 +173,16 @@ void on_data(void *u, void *u_client_data, uint8_t *buff, size_t len){
     Client *client = (Client *)u_client_data;
 
     TaskList tasks = http2_client_handle_message_async(client->http2Client, (char *)buff, len, client->token);
+    _enqueue_tasks(client, &tasks);
+
+    task_list_clear(&tasks);
+    LOG_INFO("Finished handling client data work %X\n", u_client_data);
+}
+
+static void _enqueue_tasks(Client *client, TaskList *tasks){
     Task task;
-    while(task_list_try_dequeue(&tasks, &task)){
+    while(task_list_try_dequeue(tasks, &task)){
+        LOG_TRACE("Enqueue task");
         Work *work = malloc(sizeof(Work));
         work->client = client;
         work->task = task;
@@ -182,10 +202,8 @@ void on_data(void *u, void *u_client_data, uint8_t *buff, size_t len){
         };
         cancellation_token_add_callback(client->token, ccb, &work->cch);
     }
-
-    task_list_clear(&tasks);
-    LOG_INFO("Finished handling client data work %X\n", u_client_data);
 }
+
 
 void error_handler(int signal){
     LOG_WARNING("Signal %d received. Ignoring...\n", signal);
@@ -268,7 +286,7 @@ int server_run(){
         goto exit_manager;
     }
 
-    TlsServerConfiguration config = tls_server_default_configuration(6969, cert_path, private_key_path);
+    TlsServerConfiguration config = tls_server_default_configuration(port, cert_path, private_key_path);
     config.thread_count = 2;
     config.receive_callback.invoke = on_data;
     config.connect_callback.invoke = on_connect;

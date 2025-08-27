@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include "errno.h"
@@ -20,6 +21,7 @@ struct TlsServer{
     TlsServerConfiguration configuration;
 
     int socket;
+    int stopfd;
 
     size_t actual_thread_count;
     pthread_t *threads;
@@ -85,15 +87,24 @@ TlsServer *tls_server_new(TlsServerConfiguration configuration){
         goto exit_workers;
     }
 
+    int stopfd = eventfd(0, 0);
+    if(stopfd <= 0){
+        ERRNO_ERROR("Unable to create stopfd");
+        goto exit_socket;
+    }
+
     *server = (TlsServer){
         .configuration = configuration,
         .socket = socket,
         .threads = threads,
         .workers = workers,
-        .worker_ctxs = worker_ctx
+        .worker_ctxs = worker_ctx,
+        .stopfd = stopfd
     };
 
     return server;
+exit_socket:
+    close(socket);
 exit_workers:
     for(size_t i = 0; i < configuration.thread_count; i++){
         server_worker_free(workers[i]);
@@ -127,6 +138,16 @@ void tls_server_free(TlsServer *server){
     server->threads = NULL;
     server->worker_ctxs = NULL;
     server->workers = NULL;
+
+    if(server->socket > 0){
+        close(server->socket);
+        server->socket = -1;
+    }
+
+    if(server->stopfd > 0){
+        close(server->stopfd);
+        server->stopfd = -1;
+    }
 
     free(server);
 }
@@ -165,6 +186,15 @@ static void _listen(TlsServer *server){
         goto exit_epoll;
     }
 
+    struct epoll_event stop_cfg = {
+        .events = EPOLLIN,
+        .data.fd = server->stopfd
+    };
+    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, server->stopfd, &stop_cfg) < 0){
+        ERRNO_ERROR("Failed to listen");
+        goto exit_epoll;
+    }
+
 //     struct epoll_event stop_cfg = {
 //         .events = EPOLLIN,
 //         .data.fd = worker->stopfd
@@ -180,12 +210,13 @@ static void _listen(TlsServer *server){
         int epoll_result = epoll_wait(epollfd, events, sizeof(events)/sizeof(struct epoll_event), -1);
         if(epoll_result == -1){
             if(errno == EINTR){
-                LOG_INFO("Program stop signal received");
+                LOG_TRACE("Program signal received, ignoring");
+                continue;
             }
             else{
                 ERRNO_ERROR("Wait failed");
+                goto exit_epoll;
             }
-            goto exit_epoll;
 
         }else if(epoll_result == 0){
             ERROR("What?\n");
@@ -194,6 +225,12 @@ static void _listen(TlsServer *server){
 
         for(size_t i = 0; i < epoll_result; i++){
             struct epoll_event event = events[i];
+            if(event.data.fd == server->stopfd){
+                LOG_DEBUG("Stop requested. Stopping");
+                uint64_t buff;
+                read(server->stopfd, &buff, sizeof(buff));
+                goto exit_epoll;
+            }
             if(event.data.fd == server->socket){
                 struct sockaddr_storage addr;
                 socklen_t addrlen = sizeof(addr);
@@ -214,6 +251,14 @@ static void _listen(TlsServer *server){
 
 exit_epoll:
     close(epollfd);
+    LOG_INFO("Stopped");
+}
+
+void tls_server_request_stop(TlsServer *server){
+    LOG_TRACE("Requesting stop");
+    uint64_t buff = 1;
+    write(server->stopfd, &buff, sizeof(buff));
+    LOG_DEBUG("Stop requested");
 }
 
 static ServerWorker *_schedule_worker(TlsServer *server){
@@ -232,7 +277,9 @@ static ServerWorker *_schedule_worker(TlsServer *server){
 
 static void *_run_worker(void *data){
     WorkerCtx *ctx = (WorkerCtx *)data;
-    server_worker_run(ctx->server->workers[ctx->worker_index]);
+    ServerWorker *worker = ctx->server->workers[ctx->worker_index];
+    LOG_TRACE("Running worker %zu using data at %X", ctx->worker_index, worker);
+    server_worker_run(worker);
 
     return NULL;
 }

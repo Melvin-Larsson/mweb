@@ -17,28 +17,14 @@
 #include <sys/syscall.h>
 #include "collections/slot_map.h"
 #include "errno.h"
-#include "log_levels.h"
 
 // #define USE_POLLING
 #define IO_URING_ENTRY_COUNT 4096
 
 #define max(x, y) ((x) > (y) ? (x) : (y))
 
-#if LOG_LEVEL <= LOG_LEVEL_INFO
-#define LOG_INFO(format, ...) printf("[IOUring INFO] " format "\n", ##__VA_ARGS__)
-#else
-#define LOG_INFO(format, ...)
-#endif
-
-#if LOG_LEVEL <= LOG_LEVEL_DEBUG
-#define LOG_DEBUG(format, ...) printf("[IoUring Debug] " format "\n", ##__VA_ARGS__)
-#define ERROR(format, ...) fprintf(stderr,"[IoUring Error] " format "\n", ##__VA_ARGS__)
-#define ERRNO_ERROR(format, ...) fprintf(stderr,"[IoUring Error] " format "\n\t Reason: %s\n", strerror(errno), ##__VA_ARGS__)
-#else
-#define LOG_DEBUG(format, ...)
-#define ERROR(format, ...)
-#define ERRNO_ERROR(format, ...)
-#endif
+#define LOG_CONTEXT "IoUring"
+#include "logging.h"
 
 typedef struct{
     unsigned int *tail;
@@ -226,6 +212,13 @@ exit_slot_map:
     return NULL;
 }
 
+void io_uring_request_stop(IoUring *uring){
+    LOG_TRACE("Requesting stop");
+    uint64_t buff = 1;
+    write(uring->stopfd, &buff, sizeof(buff));
+    LOG_DEBUG("Stop requested");
+}
+
 void *_run(void * data){
     IoUring *uring = (IoUring *)data;
 
@@ -234,12 +227,13 @@ void *_run(void * data){
         int epoll_result = epoll_wait(uring->epollfd, events, sizeof(events)/sizeof(struct epoll_event), -1);
         if(epoll_result == -1){
             if(errno == EINTR){
-                LOG_INFO("Program stop signal received");
+                LOG_TRACE("Program interrupt signal received, ignoring...");
+                continue;
             }
             else{
                 ERRNO_ERROR("Wait failed");
+                return NULL;
             }
-            return NULL;
         }else if(epoll_result == 0){
             ERROR("What?\n");
             continue;
@@ -248,7 +242,7 @@ void *_run(void * data){
         for(size_t i = 0; i < epoll_result; i++){
             struct epoll_event event = events[i];
             if(event.data.fd == uring->stopfd){
-                LOG_INFO("Stop signal received");
+                LOG_DEBUG("Stop signal received");
                 uint64_t buff = 0;
                 read(uring->stopfd, &buff, sizeof(buff));
                 LOG_INFO("Stopping");
@@ -290,10 +284,10 @@ static bool _read_from_cq(IoUring *uring, uint64_t *result){
     bool success = true;
     struct io_uring_cqe *event = &uring->ring.completion_ring.entries[head & *uring->ring.completion_ring.mask];
     if(event->res < 0){
-        printf("Penis\n");
         success = false;
     }
     else{
+        LOG_TRACE("Succefull io_ruing event with result %d", event->res);
         *result = event->user_data;
     }
 
@@ -319,6 +313,7 @@ bool io_uring_submit(IoUring *uring, IoUringOp op, IoUringCallback cb){
     entry->fd = op.fd;
     entry->addr = (uint64_t) op.buff;
     entry->len = op.length;
+    entry->off = op.offset;
     mempcpy(&entry->user_data, &handle, 8);
 
     uring->ring.subbmission_ring.array[index] = index;
