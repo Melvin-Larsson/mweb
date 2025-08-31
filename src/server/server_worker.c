@@ -76,15 +76,6 @@ typedef struct{
 }ClientBuffer;
 
 typedef struct{
-    pthread_mutex_t lock;
-    int enqueu_event_fd;
-    ClientHandle *clients;
-    size_t queue_size;
-    size_t enqueue;
-    size_t dequeue;
-}ClientQueue;
-
-typedef struct{
     void *u_data;
     void (*invoke)(void *u_data, void *u_client_data, const ClientHandle client, char *received, size_t size);
 }ReceivedCallback;
@@ -150,10 +141,6 @@ static void _data_buffer_initialize_empty(DataBuffer *buffer);
 static bool _data_buffer_initialize_with_data(DataBuffer *buffer, const char *data, size_t data_len);
 static void _data_buffer_clear(DataBuffer *buffer);
 static bool _data_buffer_add(DataBuffer *buffer, const char *data, size_t data_len);
-
-static bool _client_queue_initialize(ClientQueue *queue);
-static void _client_queue_clear(ClientQueue *queue);
-static bool _client_queue_enqueue(ClientQueue *queue, ClientHandle handle);
 
 static SSL_CTX * _create_ssl_context(ServerWorkerConfig *config);
 static ServerWorkerStatus _listen(ServerWorker *worker);

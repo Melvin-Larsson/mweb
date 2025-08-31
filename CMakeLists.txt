@@ -19,7 +19,6 @@ set(HTTP2_SOURCES
     src/http2/http2_common.c
     src/http2/utils.c
 
-
     src/http2/http2_frame.c
     src/http2/frames/continuation_frame.c
     src/http2/frames/data_frame.c
@@ -37,12 +36,12 @@ set(HTTP2_SOURCES
     src/http2/hpack_primitives.c
     src/http2/huffman.c
     src/http2/bit_stream.c
-
 )
 
 set(HTTP_CORE_SOURCES
     src/http_core/http_core.c
     src/http_core/stringbuilder.c
+    src/http_core/content_server.c
 )
 
 set(IO_URING_SOURCES
