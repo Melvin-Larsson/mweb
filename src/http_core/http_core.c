@@ -5,7 +5,9 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "content_server_proxy.h"
 #include "io_uring/io_uring.h"
+#include "stringbuilder.h"
 
 #define LOG_CONTEXT "HttpCore"
 #include "logging.h"
@@ -44,6 +46,7 @@ typedef struct{
 typedef struct{
     Index index;
     size_t content_count;
+    ContentServer *content_server;
 }HttpCore;
 
 struct ResponseHandle{
@@ -59,6 +62,8 @@ static void _print_index(Index *index);
 bool _init_handle(HttpCore *core, ContentHandle *handle, const char *absolute_path);
 void _clear_handle(ContentHandle *handle);
 
+static char *_populate_page(const char *content, size_t content_length, size_t *result_length);
+
 static bool _is_valid_content(const char *file_name);
 static ContentType _get_content_type(const char *file_name);
 static bool _has_file_extension(const char *file_name, const char *extension);
@@ -73,7 +78,13 @@ static bool _index_try_get_content_handle(Index *index, const char *path, size_t
 static HttpCore core;
 
 bool http_core_init(const char *content_path){
+    core.content_server = content_server_new();
+    if(core.content_server == NULL){
+        return false;
+    }
+
     if(!_index_init(&core.index)){
+//         content_server_free();
         return false;
     }
     core.content_count = 0;
@@ -295,12 +306,56 @@ void _free_partial_response_ctx(void *args){
 
 TaskList _on_partial_read(void *args){
     PartialResponseCtx *ctx = (PartialResponseCtx *)args;
-    TaskList result = ctx->callback.invoke(ctx->callback.u_data, true, ctx->data, ctx->length);
+
+    size_t content_length;
+    char *content = _populate_page((char *)ctx->data, ctx->length, &content_length);
+    TaskList result = ctx->callback.invoke(ctx->callback.u_data, true, (uint8_t *)content, content_length);
+    free(content);
 
     cancellation_token_remove_callback(ctx->token, ctx->cancel_handle);
     free(ctx->data);
     free(ctx);
     return result;
+}
+
+static char *_populate_page(const char *content, size_t content_length, size_t *result_length){
+    StringBuilder *string_builder = string_builder_new(strlen(content));
+
+    const char *start = content;
+    while(*start != '\0'){
+        char *tag_start = strstr(start, "[");
+        if(tag_start == NULL){
+            string_builder_append(string_builder, start);
+            break;
+        }
+        char *tag_end = strstr(tag_start, "]");
+        if(tag_end == NULL){
+            string_builder_append(string_builder, start);
+            break;
+        }
+
+        string_builder_append_len(string_builder, start, tag_start - start);
+
+        if(*(tag_start + 1) == '['){
+            string_builder_append(string_builder, "[");
+            start = tag_start + 2;
+            continue;
+        }
+
+        char *dynamic_content;
+        size_t dynamic_content_length;
+        if(!content_server_get_content(core.content_server, tag_start + 1, tag_end - tag_start - 1, &dynamic_content, &dynamic_content_length)){
+            LOG_INFO("Received content %.*s", (int)dynamic_content_length, dynamic_content);
+            string_builder_append_len(string_builder, dynamic_content, dynamic_content_length);
+            free(dynamic_content);
+        }
+
+        start = tag_end + 1;
+    }
+
+    char *result_content = string_builder_to_string_and_free(string_builder);
+    *result_length = strlen(result_content);
+    return result_content;
 }
 
 Task http_core_advance_partial_response_async(ResponseHandle *handle, size_t size, BodyResponseCallback callback, CancellationToken *token){

@@ -41,6 +41,10 @@ set(HTTP2_SOURCES
 set(HTTP_CORE_SOURCES
     src/http_core/http_core.c
     src/http_core/stringbuilder.c
+    src/http_core/content_server_proxy.c
+)
+
+set(CONTENT_SERVER_SOURCES
     src/http_core/content_server.c
 )
 
@@ -70,6 +74,8 @@ add_library(libthreadpool ${THREADPOOL_SOURCES})
 add_library(libiouring ${IO_URING_SOURCES})
 add_library(libcollections ${COLLECTIONS_SOURCES})
 add_library(libtask ${TASK_SOURCES})
+add_executable(content-server ${CONTENT_SERVER_SOURCES})
+
 
 configure_file(cert/cert.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
 configure_file(cert/key.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
@@ -115,6 +121,9 @@ target_include_directories(libcollections PRIVATE ${PROJECT_SOURCE_DIR}/src/coll
 
 target_include_directories(libtask PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(libtask PRIVATE ${PROJECT_SOURCE_DIR}/src/task)
+
+target_include_directories(content-server PUBLIC ${PROJECT_SOURCE_DIR}/src/http_core)
+target_include_directories(content-server PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
 set(TARGET_NAME web)
 add_executable(${TARGET_NAME} src/main.c)
