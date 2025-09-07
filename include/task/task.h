@@ -11,7 +11,8 @@ typedef struct TaskList TaskList;
 typedef enum{
     TaskTypeWork,
     TaskTypeEvent,
-    TaskTypeUring
+    TaskTypeUring,
+    TaskTypeAsync
 }TaskType;
 
 typedef struct{
@@ -31,6 +32,17 @@ typedef struct{
     IoUringOp op;
 }UringTask;
 
+typedef struct TaskRunner{
+    void (*start_async)(struct TaskRunner task_runner, void (*cb)(void *ctx), void *ctx);
+    void *ctx;
+}TaskRunner;
+
+typedef struct AsyncTask{
+    TaskList (*callback)(struct AsyncTask task);
+    void *ctx;
+    TaskRunner task_runner;
+}AsyncTask;
+
 struct Task{
     TaskType type;
     bool complete;
@@ -38,6 +50,7 @@ struct Task{
         WorkTask work_task;
         EventTask event_task;
         UringTask uring_task;
+        AsyncTask async_task;
     };
 };
 
@@ -92,6 +105,18 @@ static inline Task io_uring_task(TaskList (*worker)(void *), void *ctx, IoUringO
             .callback = worker,
             .ctx = ctx,
             .op = op
+        }
+    };
+}
+
+static inline Task async_task(TaskRunner task_runner, TaskList (*callback)(AsyncTask task), void *ctx){
+    return (Task) {
+        .type = TaskTypeAsync,
+        .complete = false,
+        .async_task = (AsyncTask){
+            .task_runner = task_runner,
+            .callback = callback,
+            .ctx = ctx
         }
     };
 }

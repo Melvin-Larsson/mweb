@@ -1,5 +1,6 @@
 #include "http_core/http_core.h"
 #include <errno.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -47,6 +48,7 @@ typedef struct{
     Index index;
     size_t content_count;
     ContentServer *content_server;
+    pthread_t content_server_thread;
 }HttpCore;
 
 struct ResponseHandle{
@@ -54,7 +56,10 @@ struct ResponseHandle{
     off_t offset;
     off_t file_size;
     Buffer buffer;
+    ContentHandle content_handle;
 };
+
+void *_run_content_server(void *data);
 
 static bool _load_content(HttpCore *core, const char *root, const char *path);
 static void _print_index(Index *index);
@@ -62,7 +67,7 @@ static void _print_index(Index *index);
 bool _init_handle(HttpCore *core, ContentHandle *handle, const char *absolute_path);
 void _clear_handle(ContentHandle *handle);
 
-static char *_populate_page(const char *content, size_t content_length, size_t *result_length);
+static TaskList _populate_page_async(const char *content, size_t content_length, void *ctx, CancellationToken *token);
 
 static bool _is_valid_content(const char *file_name);
 static ContentType _get_content_type(const char *file_name);
@@ -73,7 +78,6 @@ static bool _index_init(Index *index);
 static void _index_clear(Index *index);
 static bool _index_append(Index *index, IndexEntry entry);
 static bool _index_try_get_content_handle(Index *index, const char *path, size_t path_length, ContentHandle *handle);
-
 
 static HttpCore core;
 
@@ -96,11 +100,24 @@ bool http_core_init(const char *content_path){
 
     _print_index(&core.index);
 
+    if(pthread_create(&core.content_server_thread, 0, _run_content_server, &core) != 0){
+        ERRNO_ERROR("Unable to crete content server thread");
+        http_core_free();
+        return false;
+    }
+
     return true;
 }
 
 void http_core_free(){
     _index_clear(&core.index);
+    //FIXME: stop content server
+}
+
+void *_run_content_server(void *args){
+    HttpCore *core = (HttpCore *)args;
+    content_server_run(core->content_server);
+    return NULL;
 }
 
 typedef struct{
@@ -260,7 +277,8 @@ ResponseHandle *http_core_new_partial_response(const HttpRequest *request, HttpR
             .buffer = buffer,
             .fd = 0,
             .file_size = 0,
-            .offset = 0
+            .offset = 0,
+            .content_handle = {0}
         };
         return response_handle;
     }
@@ -286,7 +304,8 @@ ResponseHandle *http_core_new_partial_response(const HttpRequest *request, HttpR
         .buffer = buffer,
         .fd = fd,
         .offset = 0,
-        .file_size = size
+        .file_size = size,
+        .content_handle = handle
     };
     return response_handle;
 }
@@ -306,56 +325,101 @@ void _free_partial_response_ctx(void *args){
 
 TaskList _on_partial_read(void *args){
     PartialResponseCtx *ctx = (PartialResponseCtx *)args;
+    LOG_TRACE("Partial read complete for type %d", ctx->response_handle->content_handle.type);
 
-    size_t content_length;
-    char *content = _populate_page((char *)ctx->data, ctx->length, &content_length);
-    TaskList result = ctx->callback.invoke(ctx->callback.u_data, true, (uint8_t *)content, content_length);
-    free(content);
+    if(ctx->response_handle->content_handle.type != HTML){
+        ctx->callback.invoke(ctx->callback.u_data, true, ctx->data, ctx->length);
+        free(ctx->data);
+        cancellation_token_remove_callback(ctx->token, ctx->cancel_handle);
+        free(ctx);
+        return task_list_empty();
+    }
 
-    cancellation_token_remove_callback(ctx->token, ctx->cancel_handle);
-    free(ctx->data);
-    free(ctx);
-    return result;
+    return _populate_page_async((char *)ctx->data, ctx->length, ctx, ctx->token);
 }
 
-static char *_populate_page(const char *content, size_t content_length, size_t *result_length){
-    StringBuilder *string_builder = string_builder_new(strlen(content));
+TaskList _on_content_created(void *args, ContentResult result){
+    PartialResponseCtx *ctx = (PartialResponseCtx *)args;
 
-    const char *start = content;
+    LOG_TRACE("Content created: ");
+    if(result.status != ContentServerOk){
+        ERROR("Unable to create content. Error code %d", result.status);
+        return task_list_empty();
+    }
+
+    const char *start = (const char *)ctx->data;
+    StringBuilder *builder = string_builder_new(ctx->length);
+    size_t index = 0;
     while(*start != '\0'){
         char *tag_start = strstr(start, "[");
         if(tag_start == NULL){
-            string_builder_append(string_builder, start);
+            string_builder_append(builder, start);
             break;
         }
         char *tag_end = strstr(tag_start, "]");
         if(tag_end == NULL){
-            string_builder_append(string_builder, start);
+            string_builder_append(builder, start);
             break;
         }
 
-        string_builder_append_len(string_builder, start, tag_start - start);
+        string_builder_append_len(builder, start, tag_start - start);
 
         if(*(tag_start + 1) == '['){
-            string_builder_append(string_builder, "[");
+            string_builder_append(builder, "[");
             start = tag_start + 2;
             continue;
         }
 
-        char *dynamic_content;
-        size_t dynamic_content_length;
-        if(!content_server_get_content(core.content_server, tag_start + 1, tag_end - tag_start - 1, &dynamic_content, &dynamic_content_length)){
-            LOG_INFO("Received content %.*s", (int)dynamic_content_length, dynamic_content);
-            string_builder_append_len(string_builder, dynamic_content, dynamic_content_length);
-            free(dynamic_content);
+        string_builder_append_len(builder, result.content[index].content, result.content[index].length);
+        index++;
+        start = tag_end + 1;
+    }
+
+    char *result_content = string_builder_to_string_and_free(builder);
+
+    ctx->callback.invoke(ctx->callback.u_data, true, (uint8_t *)result_content, strlen(result_content));
+
+    free(result_content);
+    free(ctx->data);
+    cancellation_token_remove_callback(ctx->token, ctx->cancel_handle);
+    free(ctx);
+
+    return task_list_empty();
+}
+
+static TaskList _populate_page_async(const char *content, size_t content_length, void *ctx, CancellationToken *token){
+    const char *start = content;
+    Tag tags[128];
+    size_t tag_count = 0;
+    while(*start != '\0'){
+        char *tag_start = strstr(start, "[");
+        if(tag_start == NULL){
+            break;
         }
+        char *tag_end = strstr(tag_start, "]");
+        if(tag_end == NULL){
+            break;
+        }
+
+        if(*(tag_start + 1) == '['){
+            start = tag_start + 2;
+            continue;
+        }
+
+        tags[tag_count++] = (Tag){
+            .tag = tag_start + 1,
+            .length = tag_end - tag_start - 1
+        };
 
         start = tag_end + 1;
     }
 
-    char *result_content = string_builder_to_string_and_free(string_builder);
-    *result_length = strlen(result_content);
-    return result_content;
+    //FIXME
+    Task task = content_server_get_content_async(core.content_server, tags, tag_count, _on_content_created, ctx, token);
+
+    TaskList task_list = task_list_empty();
+    task_list_add_task(&task_list, task);
+    return task_list;
 }
 
 Task http_core_advance_partial_response_async(ResponseHandle *handle, size_t size, BodyResponseCallback callback, CancellationToken *token){
@@ -381,7 +445,7 @@ Task http_core_advance_partial_response_async(ResponseHandle *handle, size_t siz
         .callback = callback,
         .token = token,
         .data = buffer,
-        .length = read_size
+        .length = read_size,
     };
 
     CancellationTokenCallback cb = {

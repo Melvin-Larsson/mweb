@@ -49,52 +49,72 @@ static void _run(){
             continue;
         }
 
+        for(size_t i = 0; i < size; i++){
+            if(i == 24){
+                printf("- ");
+            }
+            printf("%2X ", buffer[i]);
+        }
+        printf("\n");
+        for(size_t i = 0; i < size; i++){
+            if(i == 24){
+                printf("- ");
+            }
+            char c = buffer[i] > ' ' && buffer[i] <= '~' ? buffer[i] : '?';
+            printf(" %c ", c);
+        }
+        printf("\n");
+
         _served_count++;
 
         uint8_t *data = buffer;
-        while(size > 0){
-            MessageHeader *message = (MessageHeader *)data;
-            size_t message_size = sizeof(MessageHeader) + message->payload_length;
-            if(message_size > size){
-                LOG_WARNING("Partial message received of size %d / (%d + %d). This is not supported", size, sizeof(MessageHeader), message->payload_length);
+        ParseBuffer parse_buffer;
+        buffers_init_parse_buffer(&parse_buffer, data, size);
+        while(!parse_buffer_size_is_empty(&parse_buffer)){
+            uint8_t request_data[1024];
+            Buffer request_data_buffer;
+            buffers_init_buffer(&request_data_buffer, request_data, sizeof(request_data));
+
+
+            ContentRequestMessage message;
+            DeserializeStatus status = deserialize_content_request(&parse_buffer, &message, &request_data_buffer);
+            if(status != DeserializeStatusOk){
+                ERROR("Unable to deserialize request. Reason '%s'", deserialize_status_str(status));
                 break;
             }
-            size -= message_size;
-            data += message_size;
 
-            if(message->start_of_message_identifier != START_OF_MESSAGE_IDENTIFIER){
-                LOG_WARNING("Received invalid start of message identifier 0x%X", message->start_of_message_identifier);
+            uint8_t response_data[1024];
+            Buffer response_data_buffer;
+            buffers_init_buffer(&response_data_buffer, response_data, sizeof(response_data));
+            ReplySerializerContext *reply_ctx = reply_serialier_context_create(&response_data_buffer, message.request_id);
+            if(reply_ctx == NULL){
+                ERROR("Unable to allocate reply serializer ctx");
+                continue;
+            }
+            for(size_t i = 0; i < message.tag_count; i++){
+                LOG_TRACE("Creating response for %.*s", message.tags[i].length, message.tags[i].value);
+
+                ContentFunction function;
+                if(!_try_get_content_function((char *)message.tags[i].value, message.tags[i].length, &function)){
+                    LOG_WARNING("Unknown tag");
+                    continue;
+                }
+
+                char *content = function.handle();
+                LOG_TRACE("Response for tag '%.*s'is '%s'", message.tags[i].length, message.tags[i].value, content);
+                reply_serializer_context_add_content(reply_ctx, content, strlen(content));
+                free(content);
+            }
+
+            LOG_TRACE("Serialize response");
+            size_t reply_size;
+            uint8_t *response_message = reply_serializer_context_serialize(reply_ctx, &reply_size);
+            if(response_message == NULL){
+                ERROR("Unable to serialize response message");
                 continue;
             }
 
-
-            if(message->type == ContentRequest){
-                LOG_TRACE("Received content request for %.*s", message->payload_length, message->payload);
-                ContentFunction function;
-                if(!_try_get_content_function(message->payload, message->payload_length, &function)){
-                    LOG_WARNING("Unknown tag %.*s", message->payload_length, message->payload);
-                    continue;
-                }
-                char *response = function.handle();
-                uint8_t *buffer = malloc(sizeof(MessageHeader) + strlen(response));
-                LOG_DEBUG("Responding with '%s' for tag '%.*s'", response, message->payload_length, message->payload);
-
-                MessageHeader *header = (MessageHeader *)buffer;
-                *header = (MessageHeader){
-                    .start_of_message_identifier = START_OF_MESSAGE_IDENTIFIER,
-                    .type = ContentReply,
-                    .payload_length = strlen(response),
-                    .request_id = message->request_id,
-                };
-                memcpy(header->payload, response, header->payload_length);
-                write(_socket, buffer, sizeof(MessageHeader) + header->payload_length);
-
-                free(response);
-                free(buffer);
-            }
-            else{
-                LOG_WARNING("Invalid request type %d", message->type);
-            }
+            write(_socket, response_message, reply_size);
         }
     }
 }

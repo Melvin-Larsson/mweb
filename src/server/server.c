@@ -127,6 +127,21 @@ void _on_io_uring_done_work(void *args){
     LOG_INFO("Uring event handled\n");
 }
 
+void _on_async_work_done(void *args){
+    Work *work = (Work *)args;
+    LOG_DEBUG("Async done");
+
+    AsyncTask async_task = work->task.async_task;
+    TaskList tasks = async_task.callback(async_task);
+    LOG_TRACE("Handling of async event created %d new tasks", tasks.task_count);
+    _enqueue_tasks(work->client, &tasks);
+
+    cancellation_token_remove_callback(work->client->token, work->cch);
+    pthread_mutex_destroy(&work->lock);
+    free(work);
+    LOG_INFO("Async event handled\n");
+}
+
 void on_iouring_done(void *args){
     Work *work = (Work *)args;
 
@@ -145,6 +160,25 @@ void on_iouring_done(void *args){
         IoUringOp op = uring_task.op;
         free(op.buff);
         close(op.fd);
+        pthread_mutex_destroy(&work->lock);
+        free(work);
+    }
+}
+
+void _on_async_done(void *args){
+    Work *work = (Work *)args;
+
+    pthread_mutex_lock(&work->lock);
+    if(!work->canceled){
+        LOG_TRACE("Handling io_uring result");
+        work->owned_by_io_uring = false;
+        pthread_mutex_unlock(&work->lock);
+
+        tls_server_enqueue_client_work(server, work->client->client, _on_async_work_done, work);
+    }
+    else{
+        pthread_mutex_unlock(&work->lock);
+        LOG_DEBUG("Ignoring iouring completion, task canceled");
         pthread_mutex_destroy(&work->lock);
         free(work);
     }
@@ -189,12 +223,17 @@ static void _enqueue_tasks(Client *client, TaskList *tasks){
         work->canceled = false;
         work->owned_by_io_uring = true;
         assert(pthread_mutex_init(&work->lock, 0) == 0);
-        IoUringCallback cb = {
-            .invoke = on_iouring_done,
-            .u_data = work
-        };
         if(task.type == TaskTypeUring){
+            IoUringCallback cb = {
+                .invoke = on_iouring_done,
+                .u_data = work
+            };
             io_uring_submit(uring, task.uring_task.op, cb);
+        }
+        else if(task.type == TaskTypeAsync){
+            AsyncTask async_task = task.async_task;
+            TaskRunner runner = async_task.task_runner;
+            runner.start_async(runner, _on_async_done, work);
         }
         CancellationTokenCallback ccb = {
             .on_cancel = _free_work_from_uring,

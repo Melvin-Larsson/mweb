@@ -42,10 +42,12 @@ set(HTTP_CORE_SOURCES
     src/http_core/http_core.c
     src/http_core/stringbuilder.c
     src/http_core/content_server_proxy.c
+    src/http_core/content_server_contract.c
 )
 
 set(CONTENT_SERVER_SOURCES
     src/http_core/content_server.c
+    src/http_core/content_server_contract.c
 )
 
 set(IO_URING_SOURCES
