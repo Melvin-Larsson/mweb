@@ -225,6 +225,8 @@ static void _handle_data_received(ContentServer *server){
     cb.cb(cb.ctx);
     LOG_TRACE("Callback called");
 
+    free(request.request);
+
     slot_map_remove(server->request_slot_map, handle);
 }
 
@@ -246,8 +248,6 @@ static void _handle_queue_item(ContentServer *server){
 
         LOG_TRACE("Sending request of size %zu: '%.*s'", request.request_length, request.request_length, request.request);
         write(server->client_socket, request.request, request.request_length);
-
-        free(request.request);
     }
 }
 
@@ -434,6 +434,22 @@ static ContentServerStatus _start_content_server(ContentServer *server){
         server->process_id = pid;
     }
 
+    SlotMapIterator *it = slot_map_create_iterator(server->request_slot_map);
+    if(it == NULL){
+        ERROR("Unable to create slot map iterator. Will not resend in flight requests");
+        return ContentServerOk;
+    }
+
+    LOG_TRACE("Resending in flight requests");
+    Request request;
+    size_t count = 0;
+    while(slot_map_iterator_next(it, &request)){
+        write(server->client_socket, request.request, request.request_length);
+        count++;
+    }
+    slot_map_iterator_free(it);
+    LOG_INFO("%zu request resent", count);
+
     return ContentServerOk;
 }
 
@@ -444,7 +460,7 @@ static bool _find_content_server_executable(char *result, size_t buffer_size){
         ERRNO_ERROR("Unable to locate current executable");
     }
     else if(full_path_length == MAX_PATH_LENGTH){
-        ERROR("Path too current program is too long");
+        ERROR("Path to current program is too long");
         return false;
     }
 

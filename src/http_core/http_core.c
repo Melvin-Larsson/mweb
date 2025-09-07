@@ -74,6 +74,8 @@ static ContentType _get_content_type(const char *file_name);
 static bool _has_file_extension(const char *file_name, const char *extension);
 static size_t _concat_path(char *buffer, size_t buffer_size, const char *p1, const char *p2);
 
+static const char *_strnstr(const char *haystack, const char *needle, size_t len);
+
 static bool _index_init(Index *index);
 static void _index_clear(Index *index);
 static bool _index_append(Index *index, IndexEntry entry);
@@ -350,23 +352,26 @@ TaskList _on_content_created(void *args, ContentResult result){
     const char *start = (const char *)ctx->data;
     StringBuilder *builder = string_builder_new(ctx->length);
     size_t index = 0;
-    while(*start != '\0'){
-        char *tag_start = strstr(start, "[");
+    size_t size_left = ctx->length;
+    while(size_left > 0){
+        const char *tag_start = _strnstr(start, "[", size_left);
         if(tag_start == NULL){
-            string_builder_append(builder, start);
+            string_builder_append_len(builder, start, size_left);
             break;
         }
-        char *tag_end = strstr(tag_start, "]");
+        const char *tag_end = _strnstr(tag_start, "]", size_left - (tag_start - start));
         if(tag_end == NULL){
-            string_builder_append(builder, start);
+            string_builder_append_len(builder, start, size_left);
             break;
         }
 
         string_builder_append_len(builder, start, tag_start - start);
+        size_left -= tag_start - start;
 
-        if(*(tag_start + 1) == '['){
+        if(size_left > 0 && *(tag_start + 1) == '['){
             string_builder_append(builder, "[");
             start = tag_start + 2;
+            size_left -= 2;
             continue;
         }
 
@@ -694,7 +699,7 @@ static bool _index_append(Index *index, IndexEntry entry){
     return true;
 }
 
-static const char *strnstr(const char *haystack, const char *needle, size_t len){
+static const char *_strnstr(const char *haystack, const char *needle, size_t len){
     size_t nl = strlen(needle);
     while(len >= nl){
         if(strncmp(haystack, needle, nl) == 0){
@@ -707,7 +712,7 @@ static const char *strnstr(const char *haystack, const char *needle, size_t len)
 }
 
 static bool _index_try_get_content_handle(Index *index, const char *path, size_t path_length, ContentHandle *handle){
-    const char *query = strnstr(path, "?", path_length);
+    const char *query = _strnstr(path, "?", path_length);
     LOG_DEBUG("q %s", query);
     if(query != NULL){
         path_length = query - path;
