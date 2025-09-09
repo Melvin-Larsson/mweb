@@ -78,9 +78,6 @@ add_library(libcollections ${COLLECTIONS_SOURCES})
 add_library(libtask ${TASK_SOURCES})
 add_executable(content-server ${CONTENT_SERVER_SOURCES})
 
-
-configure_file(cert/cert.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
-configure_file(cert/key.pem ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
 configure_file(config.json ${CMAKE_CURRENT_BINARY_DIR} COPYONLY)
 
 find_package(PkgConfig REQUIRED)
